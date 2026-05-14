@@ -1,6 +1,6 @@
 ---
 task: 002
-status: todo
+status: in-progress
 depends-on: []
 ---
 
