@@ -215,6 +215,26 @@ func TestRebaseOnto_HappyPath(t *testing.T) {
 	}
 }
 
+func TestListLocalBranches(t *testing.T) {
+	dir := newTestRepo(t)
+	runMust(t, dir, "git", "branch", "feature/a", "main")
+	runMust(t, dir, "git", "branch", "feature/b", "main")
+	g := New(dir)
+	branches, err := g.ListLocalBranches()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]bool{"main": true, "feature/a": true, "feature/b": true}
+	if len(branches) != 3 {
+		t.Fatalf("got %d branches, want 3: %v", len(branches), branches)
+	}
+	for _, b := range branches {
+		if !want[b] {
+			t.Fatalf("unexpected branch %q", b)
+		}
+	}
+}
+
 func TestRemoteExists_NoRemote(t *testing.T) {
 	dir := newTestRepo(t)
 	g := New(dir)

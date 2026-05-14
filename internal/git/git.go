@@ -163,3 +163,15 @@ func (g *Git) ConfigSet(key, value string) error {
 	}
 	return nil
 }
+
+func (g *Git) ListLocalBranches() ([]string, error) {
+	out, stderr, err := g.run("for-each-ref", "--format=%(refname:short)", "refs/heads")
+	if err != nil {
+		return nil, g.wrap(err, "for-each-ref refs/heads", stderr)
+	}
+	trimmed := strings.TrimSpace(string(out))
+	if trimmed == "" {
+		return nil, nil
+	}
+	return strings.Split(trimmed, "\n"), nil
+}
