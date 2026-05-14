@@ -215,6 +215,25 @@ func TestRebaseOnto_HappyPath(t *testing.T) {
 	}
 }
 
+func TestUpdateRef(t *testing.T) {
+	dir := newTestRepo(t)
+	g := New(dir)
+	sha, err := g.RevParse("HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := g.UpdateRef("refs/chainrail/snapshot/main", sha); err != nil {
+		t.Fatal(err)
+	}
+	got, err := g.RevParse("refs/chainrail/snapshot/main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != sha {
+		t.Fatalf("snapshot ref points to %q want %q", got, sha)
+	}
+}
+
 func TestListLocalBranches(t *testing.T) {
 	dir := newTestRepo(t)
 	runMust(t, dir, "git", "branch", "feature/a", "main")

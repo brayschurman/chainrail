@@ -164,6 +164,14 @@ func (g *Git) ConfigSet(key, value string) error {
 	return nil
 }
 
+func (g *Git) UpdateRef(refname, sha string) error {
+	_, stderr, err := g.run("update-ref", refname, sha)
+	if err != nil {
+		return g.wrap(err, "update-ref "+refname, stderr)
+	}
+	return nil
+}
+
 func (g *Git) ListLocalBranches() ([]string, error) {
 	out, stderr, err := g.run("for-each-ref", "--format=%(refname:short)", "refs/heads")
 	if err != nil {
