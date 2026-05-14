@@ -1,8 +1,11 @@
 package output
 
 import (
+	"errors"
 	"fmt"
 	"io"
+
+	crerrors "github.com/brayschurman/chainrail/internal/errors"
 )
 
 type Renderer interface {
@@ -88,6 +91,13 @@ func (r *TextRenderer) Error(_ io.Writer, errOut io.Writer, err error) {
 	if err == nil {
 		return
 	}
-	// TODO(007): format *errors.ChainrailError with Code and Suggestion fields.
+	var ce *crerrors.ChainrailError
+	if errors.As(err, &ce) {
+		fmt.Fprintf(errOut, "Error [%s]: %s\n", ce.Code, ce.Message)
+		if ce.Suggestion != "" {
+			fmt.Fprintf(errOut, "  Suggestion: %s\n", ce.Suggestion)
+		}
+		return
+	}
 	fmt.Fprintf(errOut, "Error: %s\n", err.Error())
 }

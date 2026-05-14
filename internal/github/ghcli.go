@@ -8,6 +8,8 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+
+	crerrors "github.com/brayschurman/chainrail/internal/errors"
 )
 
 type runner func(name string, args ...string) ([]byte, error)
@@ -138,7 +140,11 @@ func (c *GhCli) UpdatePRBase(_ context.Context, number int, newBase string) erro
 	return nil
 }
 
-// TODO(007): switch to *errors.ChainrailError with Code: CodeGhCallFailed.
 func wrapGhErr(err error, op string) error {
-	return fmt.Errorf("%s failed: %w", op, err)
+	return &crerrors.ChainrailError{
+		Code:       crerrors.CodeGhCallFailed,
+		Message:    fmt.Sprintf("%s failed: %s", op, err.Error()),
+		Suggestion: "check 'gh auth status' and ensure the gh CLI is installed",
+		Cause:      err,
+	}
 }

@@ -5,6 +5,8 @@ import (
 	"errors"
 	"strings"
 	"testing"
+
+	crerrors "github.com/brayschurman/chainrail/internal/errors"
 )
 
 func TestTextRenderer_Success_TTY(t *testing.T) {
@@ -84,4 +86,42 @@ func TestTextRenderer_Error_WritesToErrOut(t *testing.T) {
 
 func TestRendererInterface_TextRendererImplements(t *testing.T) {
 	var _ Renderer = (*TextRenderer)(nil)
+}
+
+func TestTextRenderer_Error_ChainrailError_WithSuggestion(t *testing.T) {
+	r := NewTextRenderer(false)
+	var out, errOut bytes.Buffer
+	ce := &crerrors.ChainrailError{
+		Code:       crerrors.CodeDirtyWorktree,
+		Message:    "working tree dirty",
+		Suggestion: "commit or stash",
+	}
+	r.Error(&out, &errOut, ce)
+	got := errOut.String()
+	if !strings.Contains(got, crerrors.CodeDirtyWorktree) {
+		t.Fatalf("expected code in output, got %q", got)
+	}
+	if !strings.Contains(got, "working tree dirty") {
+		t.Fatalf("expected message in output, got %q", got)
+	}
+	if !strings.Contains(got, "commit or stash") {
+		t.Fatalf("expected suggestion in output, got %q", got)
+	}
+}
+
+func TestTextRenderer_Error_ChainrailError_NoSuggestion(t *testing.T) {
+	r := NewTextRenderer(false)
+	var out, errOut bytes.Buffer
+	ce := &crerrors.ChainrailError{
+		Code:    crerrors.CodeNotGitRepo,
+		Message: "not a git repo",
+	}
+	r.Error(&out, &errOut, ce)
+	got := errOut.String()
+	if !strings.Contains(got, "NOT_GIT_REPO") {
+		t.Fatalf("expected code, got %q", got)
+	}
+	if strings.Contains(got, "Suggestion:") {
+		t.Fatalf("should not include Suggestion line when empty: %q", got)
+	}
 }
