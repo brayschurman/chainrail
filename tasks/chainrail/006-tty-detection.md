@@ -1,6 +1,6 @@
 ---
 task: 006
-status: in-progress
+status: done
 depends-on: []
 ---
 
