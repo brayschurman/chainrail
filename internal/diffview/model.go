@@ -10,10 +10,11 @@ import (
 
 // Model is the bubbletea model for the PR diff viewer.
 type Model struct {
-	Title  string // e.g. "#687 wall drawing UX"
-	Files  []File
-	width  int
-	height int
+	Title       string // e.g. "#687 wall drawing UX"
+	Files       []File
+	width       int
+	height      int
+	highlighter *Highlighter
 
 	cursor   int // file index in sidebar
 	scrollY  int // line index at top of diff pane
@@ -44,7 +45,13 @@ const (
 )
 
 func New(title string, files []File) Model {
-	return Model{Title: title, Files: files, width: defaultWidth, height: defaultHeight}
+	return Model{
+		Title:       title,
+		Files:       files,
+		width:       defaultWidth,
+		height:      defaultHeight,
+		highlighter: NewHighlighter(),
+	}
 }
 
 func (m Model) Init() tea.Cmd { return nil }
@@ -145,9 +152,11 @@ func (m Model) renderDiff() string {
 		l := f.Lines[i]
 		switch l.Kind {
 		case LineAdd:
-			b.WriteString(styleAdd.Render(l.Text))
+			b.WriteString(styleAdd.Render("+") + m.highlightRest(f.Path, l.Text))
 		case LineDel:
-			b.WriteString(styleDel.Render(l.Text))
+			b.WriteString(styleDel.Render("-") + m.highlightRest(f.Path, l.Text))
+		case LineContext:
+			b.WriteString(" " + m.highlightRest(f.Path, l.Text))
 		case LineHunk:
 			b.WriteString(styleHunk.Render(l.Text))
 		case LineFile:
@@ -193,6 +202,23 @@ func (m Model) maxScroll() int {
 		return 0
 	}
 	return n
+}
+
+// highlightRest highlights everything after the leading +/-/space marker of
+// a content line. Returns the unmarked body either chroma-highlighted or
+// plain if the highlighter is disabled / lexer is unknown.
+func (m Model) highlightRest(path, text string) string {
+	if len(text) == 0 {
+		return ""
+	}
+	body := text
+	if len(text) >= 1 && (text[0] == '+' || text[0] == '-' || text[0] == ' ') {
+		body = text[1:]
+	}
+	if m.highlighter == nil {
+		return body
+	}
+	return m.highlighter.Highlight(path, body)
 }
 
 func truncatePath(p string, max int) string {
