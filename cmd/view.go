@@ -66,6 +66,12 @@ func runView(out io.Writer, r output.Renderer, number int, deps viewDeps) error 
 	files := diffview.Parse(diff)
 	title := fmt.Sprintf("#%d %s", pr.Number, pr.Title)
 	m := diffview.New(title, files)
+	m.PRBody = pr.Body
+	m.PRNumber = pr.Number
+	m.PlanSignal = diffview.DetectPlan(pr.Body)
+	m.PlanNudger = func(num int, body string) error {
+		return deps.gh.CommentOnPR(context.Background(), num, body)
+	}
 
 	// Best-effort review-state wiring. If any of these calls fail we skip
 	// the review UI entirely rather than refusing to open the viewer.

@@ -163,6 +163,11 @@ func (m *MockGhClient) UpdatePRBody(_ context.Context, number int, body string) 
 	return nil
 }
 
+func (m *MockGhClient) CommentOnPR(_ context.Context, number int, body string) error {
+	m.record(fmt.Sprintf("CommentOnPR(%d,%s)", number, body))
+	return nil
+}
+
 func (m *MockGhClient) RepoInfo(_ context.Context) (string, string, error) {
 	m.record("RepoInfo")
 	if m.repoOwner == "" {

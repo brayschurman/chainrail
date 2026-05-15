@@ -59,6 +59,7 @@ type interfaceShape interface {
 	PRDiff(ctx context.Context, number int) (string, error)
 	PRFiles(ctx context.Context, number int) ([]PRFile, error)
 	RepoInfo(ctx context.Context) (owner, name string, err error)
+	CommentOnPR(ctx context.Context, number int, body string) error
 }
 
 func TestGitHubClientInterfaceShape(t *testing.T) {

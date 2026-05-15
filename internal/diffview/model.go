@@ -42,6 +42,16 @@ type Model struct {
 	// Populated by runDetectors.
 	PromptInjectSignals map[string]PromptInjectSignal
 
+	// PRBody is the PR description text — used by the plan detector.
+	PRBody string
+	// PlanSignal is the verdict from DetectPlan on PRBody.
+	PlanSignal PlanSignal
+	// PRNumber for posting the nudge comment.
+	PRNumber int
+	// PlanNudger sends the nudge comment when the reviewer presses P.
+	// Optional; nil disables the nudge.
+	PlanNudger func(number int, body string) error
+
 	// RepoRoot is the local filesystem path of the repo, used by the
 	// duplicate-detector's git grep. Optional; when unset, dupe detection
 	// is skipped.
@@ -189,6 +199,7 @@ func (m *Model) runDetectors() {
 	if m.PromptInjectSignals == nil {
 		m.PromptInjectSignals = map[string]PromptInjectSignal{}
 	}
+	m.PlanSignal = DetectPlan(m.PRBody)
 	for _, f := range m.Files {
 		if sig := DetectCIRisk(f.Path, f.Lines); sig.Risk > CIRiskNone {
 			m.CISignals[f.Path] = sig
@@ -357,6 +368,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.jumpToNextUnreviewed()
 		case "W":
 			return m.startWaiver()
+		case "P":
+			return m, m.nudgeForPlan()
 		}
 	}
 	if m.scrollY > m.maxScroll() {
@@ -434,6 +447,12 @@ func (m Model) View() string {
 func (m Model) renderTopBar() string {
 	left := " " + styleTitle.Render("chainrail") + "  " + styleHeading.Render(m.Title)
 
+	// Plan-presence indicator (small, before the progress bar)
+	planBadge := m.planBadge()
+	if planBadge != "" {
+		left += "  " + planBadge
+	}
+
 	if m.ReviewState == nil {
 		return styleChrome.Width(m.width).Render(left)
 	}
@@ -465,6 +484,29 @@ func (m Model) renderTopBar() string {
 		gap = 1
 	}
 	return styleChrome.Render(left) + styleChrome.Render(strings.Repeat(" ", gap)) + right + styleChrome.Render(" ")
+}
+
+// planBadge renders a one-chip indicator for plan presence. Empty when PR
+// body is unknown (PlanSignal zero-value with Chars=0 happens both for "no
+// body" and "we never set PRBody"; the unset case is treated as silence).
+func (m Model) planBadge() string {
+	switch m.PlanSignal.Severity {
+	case PlanPresent:
+		return styleChrome.Foreground(lipgloss.Color("82")).Render("✓ plan")
+	case PlanThin:
+		return styleChrome.Foreground(lipgloss.Color("214")).Render("⚠ thin plan")
+	case PlanMissing:
+		if m.PRBody == "" && len(m.Files) == 0 {
+			return ""
+		}
+		// Show the P keystroke hint when a nudge hasn't been sent yet.
+		hint := ""
+		if m.ReviewState != nil && m.ReviewState.NudgedForPlanAt.IsZero() && m.PlanNudger != nil {
+			hint = styleChrome.Foreground(lipgloss.Color("245")).Render("  [P nudge]")
+		}
+		return styleChrome.Foreground(lipgloss.Color("196")).Render("🚨 no plan") + hint
+	}
+	return ""
 }
 
 // progressBar renders a small ▰▰▰▱▱▱ bar of `width` cells.
@@ -637,6 +679,38 @@ func (m *Model) toggleReviewed() {
 	}
 	// Invalidate sidebar cache so the checkmark redraws on the next frame.
 	m.rc.sideRows = nil
+}
+
+// nudgeMsg comes back when the plan-nudge comment finishes posting.
+type nudgeMsg struct {
+	err error
+}
+
+// nudgeForPlan posts the templated "request a plan" comment to the PR. If a
+// nudge has already been recorded in the review state, this is a no-op so we
+// don't double-prompt the author.
+func (m *Model) nudgeForPlan() tea.Cmd {
+	if m.PlanNudger == nil || m.PRNumber == 0 {
+		return nil
+	}
+	if m.ReviewState != nil && !m.ReviewState.NudgedForPlanAt.IsZero() {
+		return nil
+	}
+	nudger := m.PlanNudger
+	num := m.PRNumber
+	body := PlanNudgeMessage
+	// Mark the nudge BEFORE the network call so a slow/failed request still
+	// updates state — the reviewer can manually retry if needed.
+	if m.ReviewState != nil {
+		m.ReviewState.NudgedForPlanAt = time.Now()
+		if m.ReviewStore != nil {
+			_ = m.ReviewStore.Save(m.RepoOwner, m.RepoName, m.ReviewState)
+		}
+	}
+	return func() tea.Msg {
+		err := nudger(num, body)
+		return nudgeMsg{err: err}
+	}
 }
 
 // startWaiver opens the waiver textinput on a CI-risk file. No-op if the

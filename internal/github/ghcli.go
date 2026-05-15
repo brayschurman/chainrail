@@ -341,6 +341,14 @@ func (c *GhCli) UpdatePRBody(_ context.Context, number int, body string) error {
 	return nil
 }
 
+func (c *GhCli) CommentOnPR(_ context.Context, number int, body string) error {
+	_, err := c.run("gh", "pr", "comment", strconv.Itoa(number), "--body", body)
+	if err != nil {
+		return wrapGhErr(err, fmt.Sprintf("gh pr comment %d", number))
+	}
+	return nil
+}
+
 func (c *GhCli) RepoInfo(_ context.Context) (string, string, error) {
 	out, err := c.run("gh", "repo", "view", "--json", "owner,name",
 		"--jq", `.owner.login + "/" + .name`)

@@ -35,6 +35,9 @@ type GitHubClient interface {
 	// `gh` CLI's repo resolution (i.e. respects $GH_REPO or the local
 	// remote).
 	RepoInfo(ctx context.Context) (owner, name string, err error)
+	// CommentOnPR posts a plain comment to the PR (not a review comment).
+	// Used by the "request a plan" nudge.
+	CommentOnPR(ctx context.Context, number int, body string) error
 }
 
 // PRFile is one file's metadata from a PR — enough to drive per-file
