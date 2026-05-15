@@ -49,6 +49,35 @@ func (m *MockGhClient) ListOpenPRs(_ context.Context) ([]PullRequest, error) {
 	return out, nil
 }
 
+func (m *MockGhClient) ListMergedPRsByHead(_ context.Context, heads []string) ([]PullRequest, error) {
+	m.record(fmt.Sprintf("ListMergedPRsByHead(%v)", heads))
+	headSet := make(map[string]bool, len(heads))
+	for _, h := range heads {
+		headSet[h] = true
+	}
+	type entry struct {
+		num int
+		pr  PullRequest
+	}
+	byHead := map[string]entry{}
+	for num, pr := range m.PRs {
+		if pr.State != "MERGED" {
+			continue
+		}
+		if !headSet[pr.HeadRefName] {
+			continue
+		}
+		if existing, ok := byHead[pr.HeadRefName]; !ok || num > existing.num {
+			byHead[pr.HeadRefName] = entry{num: num, pr: pr}
+		}
+	}
+	out := make([]PullRequest, 0, len(byHead))
+	for _, e := range byHead {
+		out = append(out, e.pr)
+	}
+	return out, nil
+}
+
 func (m *MockGhClient) GetPR(_ context.Context, number int) (PullRequest, error) {
 	m.record(fmt.Sprintf("GetPR(%d)", number))
 	pr, ok := m.PRs[number]

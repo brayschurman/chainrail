@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -179,4 +180,192 @@ func TestRunSync_FromTrunk_NotOnStack(t *testing.T) {
 	mustExec(t, dir, "git", "checkout", "main")
 	err := runSync(&bytes.Buffer{}, newRendererForTests(), syncDeps{cwd: dir, gh: mock})
 	assertChainrailErr(t, err, crerrors.CodeNotOnStack)
+}
+
+// TestSync_SquashMergedParent is the marquee feature: PR #683 fix.
+//
+// Setup:
+//   - 2-branch stack: schema (PR #100) and api (PR #101)
+//   - schema's PR was squash-merged into main on GitHub (we simulate by
+//     advancing remote main with a commit that produces the same content)
+//   - api is still open; its base on GitHub is still "bray/foo-1-schema"
+//   - Locally, the user has both branches at their pre-merge tips
+//
+// Expected after sync:
+//   - api's history contains the new main HEAD (the "squash commit") plus
+//     api's unique commits, with NO duplicated schema commits
+//   - PR #101's base on GitHub has been flipped to "main"
+//   - No conflicts thrown
+func TestSync_SquashMergedParent(t *testing.T) {
+	dir, mock := submittedStack(t)
+
+	// Find the open PRs in the mock and grab the schema one.
+	var schemaPR, apiPR github.PullRequest
+	for _, pr := range mock.PRs {
+		if pr.HeadRefName == "bray/foo-1-schema" {
+			schemaPR = pr
+		}
+		if pr.HeadRefName == "bray/foo-2-api" {
+			apiPR = pr
+		}
+	}
+
+	// Simulate squash-merge of schema: advance remote main with a commit whose
+	// tree matches what schema produced (so api's unique commits will replay cleanly).
+	remoteURL := strings.TrimSpace(mustOutput(t, dir, "git", "remote", "get-url", "origin"))
+	tmpClone := t.TempDir()
+	mustExec(t, "", "git", "clone", remoteURL, tmpClone)
+	mustExec(t, tmpClone, "git", "config", "user.email", "merger@test.com")
+	mustExec(t, tmpClone, "git", "config", "user.name", "merger")
+	// Mirror schema's effect: write s.txt with the schema branch's content.
+	if err := os.WriteFile(filepath.Join(tmpClone, "s.txt"), []byte("schema\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, tmpClone, "git", "add", ".")
+	mustExec(t, tmpClone, "git", "commit", "-m", "squash of schema (#100)")
+	mustExec(t, tmpClone, "git", "push", "origin", "main")
+
+	// Now we need the squash SHA — fetch it from the bare remote.
+	cloneSHA := strings.TrimSpace(mustOutput(t, tmpClone, "git", "rev-parse", "HEAD"))
+
+	// Mark schema's PR as MERGED with that SHA in the mock.
+	mock.SetState(schemaPR.Number, "MERGED")
+	pr := mock.PRs[schemaPR.Number]
+	pr.MergeCommitSHA = cloneSHA
+	mock.PRs[schemaPR.Number] = pr
+
+	// Run sync from the api branch.
+	mustExec(t, dir, "git", "checkout", "bray/foo-2-api")
+	if err := runSync(&bytes.Buffer{}, newRendererForTests(), syncDeps{cwd: dir, gh: mock}); err != nil {
+		t.Fatalf("sync should succeed via squash recovery, got: %v", err)
+	}
+
+	// (1) PR #101's base should now be "main".
+	updatedAPI, _ := mock.GetPR(context.Background(), apiPR.Number)
+	if updatedAPI.BaseRefName != "main" {
+		t.Fatalf("api PR base: got %q want main", updatedAPI.BaseRefName)
+	}
+
+	// (2) api branch history should contain the squash commit and the api commit,
+	//     but NOT a duplicate schema commit (only one s.txt-writing commit reachable).
+	log := mustOutput(t, dir, "git", "log", "--format=%s", "bray/foo-2-api")
+	if !strings.Contains(log, "squash of schema") {
+		t.Fatalf("api history should include the squash commit, got:\n%s", log)
+	}
+	if !strings.Contains(log, "api") {
+		t.Fatalf("api history should still include the api commit, got:\n%s", log)
+	}
+	// Count occurrences of "schema" lines that aren't the squash. Original schema branch
+	// commit message was "schema" — if duplication happened that string would appear.
+	schemaCommits := strings.Count(log, "\nschema\n") + strings.Count(log, "schema\n")
+	// We expect exactly 1 occurrence (the "squash of schema (#100)" line, which contains "schema").
+	// Tighter check: the original "schema" commit message (line equals "schema" exactly) should not appear.
+	for _, line := range strings.Split(log, "\n") {
+		if line == "schema" {
+			t.Fatalf("original schema commit leaked into api after squash recovery:\n%s", log)
+		}
+	}
+	_ = schemaCommits
+}
+
+// TestSync_DoubleSquashedParents handles two squash-merges in a row (rare but
+// real: PRs #1 and #2 both merged via squash while #3 was still pending).
+func TestSync_DoubleSquashedParents(t *testing.T) {
+	dir := initTestRepoWithChainrail(t)
+	remoteDir := t.TempDir() + "/remote.git"
+	mustExec(t, "", "git", "init", "--bare", "-b", "main", remoteDir)
+	mustExec(t, dir, "git", "remote", "add", "origin", remoteDir)
+	mustExec(t, dir, "git", "push", "origin", "main")
+
+	// 3-branch stack
+	mustExec(t, dir, "git", "checkout", "-b", "bray/zz-1-schema")
+	if err := os.WriteFile(filepath.Join(dir, "s.txt"), []byte("schema\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, dir, "git", "add", ".")
+	mustExec(t, dir, "git", "commit", "-m", "schema")
+
+	mustExec(t, dir, "git", "checkout", "-b", "bray/zz-2-api")
+	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("api\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, dir, "git", "add", ".")
+	mustExec(t, dir, "git", "commit", "-m", "api")
+
+	mustExec(t, dir, "git", "checkout", "-b", "bray/zz-3-ui")
+	if err := os.WriteFile(filepath.Join(dir, "u.txt"), []byte("ui\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, dir, "git", "add", ".")
+	mustExec(t, dir, "git", "commit", "-m", "ui")
+
+	mock := github.NewMock()
+	mock.User = "bray"
+	if err := runSubmit(&bytes.Buffer{}, newRendererForTests(), submitDeps{cwd: dir, gh: mock}); err != nil {
+		t.Fatal(err)
+	}
+
+	var schemaPR, apiPR, uiPR github.PullRequest
+	for _, pr := range mock.PRs {
+		switch pr.HeadRefName {
+		case "bray/zz-1-schema":
+			schemaPR = pr
+		case "bray/zz-2-api":
+			apiPR = pr
+		case "bray/zz-3-ui":
+			uiPR = pr
+		}
+	}
+
+	// Simulate squash-merge of schema and api in succession.
+	remoteURL := strings.TrimSpace(mustOutput(t, dir, "git", "remote", "get-url", "origin"))
+	tmpClone := t.TempDir()
+	mustExec(t, "", "git", "clone", remoteURL, tmpClone)
+	mustExec(t, tmpClone, "git", "config", "user.email", "merger@test.com")
+	mustExec(t, tmpClone, "git", "config", "user.name", "merger")
+
+	if err := os.WriteFile(filepath.Join(tmpClone, "s.txt"), []byte("schema\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, tmpClone, "git", "add", ".")
+	mustExec(t, tmpClone, "git", "commit", "-m", "squash of schema")
+	schemaSquashSHA := strings.TrimSpace(mustOutput(t, tmpClone, "git", "rev-parse", "HEAD"))
+
+	if err := os.WriteFile(filepath.Join(tmpClone, "a.txt"), []byte("api\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, tmpClone, "git", "add", ".")
+	mustExec(t, tmpClone, "git", "commit", "-m", "squash of api")
+	apiSquashSHA := strings.TrimSpace(mustOutput(t, tmpClone, "git", "rev-parse", "HEAD"))
+
+	mustExec(t, tmpClone, "git", "push", "origin", "main")
+
+	mock.SetState(schemaPR.Number, "MERGED")
+	sp := mock.PRs[schemaPR.Number]
+	sp.MergeCommitSHA = schemaSquashSHA
+	mock.PRs[schemaPR.Number] = sp
+
+	mock.SetState(apiPR.Number, "MERGED")
+	ap := mock.PRs[apiPR.Number]
+	ap.MergeCommitSHA = apiSquashSHA
+	mock.PRs[apiPR.Number] = ap
+
+	mustExec(t, dir, "git", "checkout", "bray/zz-3-ui")
+	if err := runSync(&bytes.Buffer{}, newRendererForTests(), syncDeps{cwd: dir, gh: mock}); err != nil {
+		t.Fatalf("sync with two squashed parents should succeed, got: %v", err)
+	}
+
+	// PR #ui's base should now be main.
+	updatedUI, _ := mock.GetPR(context.Background(), uiPR.Number)
+	if updatedUI.BaseRefName != "main" {
+		t.Fatalf("ui PR base after double squash recovery: got %q want main", updatedUI.BaseRefName)
+	}
+
+	// ui should have main + squash of schema + squash of api + ui (and nothing else).
+	log := mustOutput(t, dir, "git", "log", "--format=%s", "bray/zz-3-ui")
+	for _, line := range strings.Split(log, "\n") {
+		if line == "schema" || line == "api" {
+			t.Fatalf("original %q commit leaked into ui after double squash recovery:\n%s", line, log)
+		}
+	}
 }
