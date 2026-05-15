@@ -36,9 +36,13 @@ type Layer struct {
 	CIStatus       string `json:"ci_status"`       // SUCCESS, FAILURE, PENDING, ""
 	ReviewDecision string `json:"review_decision"` // APPROVED, CHANGES_REQUESTED, REVIEW_REQUIRED, ""
 	UpdatedAt      string `json:"updated_at"`      // RFC3339; "" if unknown
-	IsCurrent      bool   `json:"is_current"`
-	NeedsSync      bool   `json:"needs_sync"`
-	Depth          int    `json:"depth"` // nesting depth for tree view (--all mode)
+	// ChangesSinceReview is the number of commits added since the current
+	// user's last review on this PR; 0 means "no prior review or no new
+	// commits since."
+	ChangesSinceReview int  `json:"changes_since_review"`
+	IsCurrent          bool `json:"is_current"`
+	NeedsSync          bool `json:"needs_sync"`
+	Depth              int  `json:"depth"` // nesting depth for tree view (--all mode)
 }
 
 // PendingAction is an action the user triggered that the caller should run
@@ -555,6 +559,10 @@ func (m Model) View() string {
 		}
 		if badge := reviewBadge(l.ReviewDecision); badge != "" {
 			b.WriteString(" " + badge)
+		}
+		if l.ChangesSinceReview > 0 {
+			label := fmt.Sprintf("Δ %d since review", l.ChangesSinceReview)
+			b.WriteString(" · " + styleWarn.Render(label))
 		}
 
 		if l.NeedsSync {

@@ -11,6 +11,11 @@ type GitHubClient interface {
 	// ListReviewRequestedPRs returns open PRs where the current user is a
 	// requested reviewer. Used by the Review tab.
 	ListReviewRequestedPRs(ctx context.Context) ([]PullRequest, error)
+	// ChangesSinceReview returns a map keyed by PR number of how many commits
+	// have landed on each PR after the current user's most recent review.
+	// Only includes PRs the user has actually reviewed; PRs absent from the
+	// map should be treated as "no prior review."
+	ChangesSinceReview(ctx context.Context) (map[int]int, error)
 	// ListMergedPRsByHead returns at most one merged PR per head (the most recent
 	// by number when there are duplicates). Heads that have no merged PR are
 	// simply absent from the result. Used by sync's squash-merged-parent detection.

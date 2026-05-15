@@ -6,11 +6,12 @@ import (
 )
 
 type MockGhClient struct {
-	User            string
-	PRs             map[int]PullRequest
-	NextNum         int
-	Calls           []string
-	reviewRequested map[int]bool
+	User               string
+	PRs                map[int]PullRequest
+	NextNum            int
+	Calls              []string
+	reviewRequested    map[int]bool
+	changesSinceReview map[int]int
 }
 
 func NewMock() *MockGhClient {
@@ -76,6 +77,19 @@ func (m *MockGhClient) ListReviewRequestedPRs(_ context.Context) ([]PullRequest,
 		if pr.State == "OPEN" && m.reviewRequested[num] {
 			out = append(out, pr)
 		}
+	}
+	return out, nil
+}
+
+func (m *MockGhClient) SetChangesSinceReview(byPR map[int]int) {
+	m.changesSinceReview = byPR
+}
+
+func (m *MockGhClient) ChangesSinceReview(_ context.Context) (map[int]int, error) {
+	m.record("ChangesSinceReview")
+	out := make(map[int]int, len(m.changesSinceReview))
+	for k, v := range m.changesSinceReview {
+		out[k] = v
 	}
 	return out, nil
 }

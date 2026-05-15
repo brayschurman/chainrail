@@ -168,6 +168,54 @@ func TestGhCli_ListOpenPRs_ParsesCIAndReview(t *testing.T) {
 	}
 }
 
+func TestGhCli_ChangesSinceReview_CountsCommitsAfterUserReview(t *testing.T) {
+	cli := newFakeCli(t, map[string][]byte{
+		"gh api user --jq .login": []byte("brayschurman\n"),
+		"gh pr list --search reviewed-by:@me is:open --limit 50 --json number": []byte(`[
+{"number":10},{"number":11},{"number":12}
+]`),
+		// PR 10: user reviewed at T1, 2 commits after, 1 before -> 2
+		"gh pr view 10 --json reviews,commits": []byte(`{
+"reviews":[
+  {"author":{"login":"someone-else"},"submittedAt":"2026-05-13T18:00:00Z"},
+  {"author":{"login":"brayschurman"},"submittedAt":"2026-05-13T10:00:00Z"}
+],
+"commits":[
+  {"committedDate":"2026-05-12T09:00:00Z"},
+  {"committedDate":"2026-05-13T11:00:00Z"},
+  {"committedDate":"2026-05-13T20:00:00Z"}
+]
+}`),
+		// PR 11: user reviewed at T2, no commits after -> absent from map
+		"gh pr view 11 --json reviews,commits": []byte(`{
+"reviews":[{"author":{"login":"brayschurman"},"submittedAt":"2026-05-14T00:00:00Z"}],
+"commits":[{"committedDate":"2026-05-13T11:00:00Z"}]
+}`),
+		// PR 12: only someone else reviewed -> absent
+		"gh pr view 12 --json reviews,commits": []byte(`{
+"reviews":[{"author":{"login":"someone-else"},"submittedAt":"2026-05-13T18:00:00Z"}],
+"commits":[{"committedDate":"2026-05-13T20:00:00Z"}]
+}`),
+	})
+
+	got, err := cli.ChangesSinceReview(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("expected exactly 1 PR with changes, got %v", got)
+	}
+	if got[10] != 2 {
+		t.Errorf("PR 10: got %d, want 2", got[10])
+	}
+	if _, ok := got[11]; ok {
+		t.Error("PR 11 should be absent — no commits since user's review")
+	}
+	if _, ok := got[12]; ok {
+		t.Error("PR 12 should be absent — user has not reviewed")
+	}
+}
+
 func TestGhCli_UpdatePRTitle(t *testing.T) {
 	var got []string
 	cli := &GhCli{run: func(name string, args ...string) ([]byte, error) {

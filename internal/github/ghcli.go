@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	crerrors "github.com/brayschurman/chainrail/internal/errors"
 )
@@ -175,6 +176,96 @@ func (c *GhCli) ListReviewRequestedPRs(_ context.Context) ([]PullRequest, error)
 		prs[i] = r.toPR()
 	}
 	return prs, nil
+}
+
+// ChangesSinceReview fetches the open PRs the current user has reviewed and
+// counts commits that landed after each review. Returns a map keyed by PR
+// number. PRs the user hasn't reviewed are absent from the map.
+//
+// Implementation: a single search to enumerate reviewed PRs, then per-PR
+// fetches of reviews + commits. Capped at 50 PRs to bound the gh fanout.
+func (c *GhCli) ChangesSinceReview(_ context.Context) (map[int]int, error) {
+	user, err := c.CurrentUser(context.Background())
+	if err != nil {
+		return nil, err
+	}
+
+	listOut, err := c.run("gh", "pr", "list",
+		"--search", "reviewed-by:@me is:open",
+		"--limit", "50",
+		"--json", "number",
+	)
+	if err != nil {
+		return nil, wrapGhErr(err, "gh pr list --search reviewed-by:@me")
+	}
+	var numbers []struct {
+		Number int `json:"number"`
+	}
+	if err := json.Unmarshal(listOut, &numbers); err != nil {
+		return nil, fmt.Errorf("parse gh pr list (reviewed-by): %w", err)
+	}
+
+	out := make(map[int]int, len(numbers))
+	for _, n := range numbers {
+		count, ok := c.commitsAfterUserReview(n.Number, user)
+		if ok && count > 0 {
+			out[n.Number] = count
+		}
+	}
+	return out, nil
+}
+
+// commitsAfterUserReview returns the number of commits on PR `num` whose
+// committedDate is strictly after the most recent review by `user`. The bool
+// is false on parse/fetch error — callers treat that as "skip this PR."
+func (c *GhCli) commitsAfterUserReview(num int, user string) (int, bool) {
+	out, err := c.run("gh", "pr", "view", strconv.Itoa(num),
+		"--json", "reviews,commits",
+	)
+	if err != nil {
+		return 0, false
+	}
+	var raw struct {
+		Reviews []struct {
+			Author      struct{ Login string } `json:"author"`
+			SubmittedAt string                 `json:"submittedAt"`
+		} `json:"reviews"`
+		Commits []struct {
+			CommittedDate string `json:"committedDate"`
+		} `json:"commits"`
+	}
+	if err := json.Unmarshal(out, &raw); err != nil {
+		return 0, false
+	}
+
+	var latest time.Time
+	for _, r := range raw.Reviews {
+		if r.Author.Login != user {
+			continue
+		}
+		t, err := time.Parse(time.RFC3339, r.SubmittedAt)
+		if err != nil {
+			continue
+		}
+		if t.After(latest) {
+			latest = t
+		}
+	}
+	if latest.IsZero() {
+		return 0, false
+	}
+
+	count := 0
+	for _, c := range raw.Commits {
+		t, err := time.Parse(time.RFC3339, c.CommittedDate)
+		if err != nil {
+			continue
+		}
+		if t.After(latest) {
+			count++
+		}
+	}
+	return count, true
 }
 
 func (c *GhCli) ListMergedPRsByHead(_ context.Context, heads []string) ([]PullRequest, error) {

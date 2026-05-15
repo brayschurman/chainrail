@@ -49,6 +49,7 @@ type interfaceShape interface {
 	ListOpenPRs(ctx context.Context) ([]PullRequest, error)
 	ListAllOpenPRs(ctx context.Context) ([]PullRequest, error)
 	ListReviewRequestedPRs(ctx context.Context) ([]PullRequest, error)
+	ChangesSinceReview(ctx context.Context) (map[int]int, error)
 	ListMergedPRsByHead(ctx context.Context, heads []string) ([]PullRequest, error)
 	GetPR(ctx context.Context, number int) (PullRequest, error)
 	CreatePR(ctx context.Context, p NewPR) (PullRequest, error)

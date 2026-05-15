@@ -203,6 +203,14 @@ func runStatusStack(ctx context.Context, out io.Writer, r output.Renderer, asJSO
 	reviewLayers := buildReviewLayers(ctx, deps.gh, currentBranch)
 	allLayers := buildAllLayers(ctx, deps.gh, currentBranch)
 
+	// Annotate every layer with the user's "changes since my last review"
+	// count. Best-effort: a single search + N gh views, cached for this call.
+	if changes, err := deps.gh.ChangesSinceReview(ctx); err == nil {
+		annotateChangesSinceReview(layers, changes)
+		annotateChangesSinceReview(reviewLayers, changes)
+		annotateChangesSinceReview(allLayers, changes)
+	}
+
 	tabs := []tui.Tab{
 		{Label: "Mine", Layers: layers},
 		{Label: "Review", Layers: reviewLayers},
@@ -210,6 +218,14 @@ func runStatusStack(ctx context.Context, out io.Writer, r output.Renderer, asJSO
 	}
 
 	return launchTUIWithTabs(out, r, tabs, 0, deps)
+}
+
+func annotateChangesSinceReview(layers []tui.Layer, byPR map[int]int) {
+	for i := range layers {
+		if n, ok := byPR[layers[i].PRNumber]; ok {
+			layers[i].ChangesSinceReview = n
+		}
+	}
 }
 
 // buildReviewLayers returns one Layer per PR where the current user is a
