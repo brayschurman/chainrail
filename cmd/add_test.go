@@ -124,6 +124,50 @@ func TestRunAdd_DifferentUser_NotOnStack(t *testing.T) {
 	assertChainrailErr(t, err, crerrors.CodeNotOnStack)
 }
 
+func TestParseStackBranch(t *testing.T) {
+	cases := []struct {
+		branch   string
+		user     string
+		wantOK   bool
+		wantBase string
+		wantPos  int
+		wantTask string
+	}{
+		// simple slug, no hyphens
+		{"bray/feat-1-schema", "bray", true, "feat", 1, "schema"},
+		// base slug with hyphens
+		{"bray/ignore-logs-1-ignore-logs", "bray", true, "ignore-logs", 1, "ignore-logs"},
+		// task slug with hyphens
+		{"bray/feat-2-my-task", "bray", true, "feat", 2, "my-task"},
+		// both slugs with hyphens
+		{"bray/dev-200-3-fix-null-check", "bray", true, "dev-200", 3, "fix-null-check"},
+		// position > 1
+		{"bray/ignore-logs-2-readme", "bray", true, "ignore-logs", 2, "readme"},
+		// wrong user
+		{"alice/feat-1-schema", "bray", false, "", 0, ""},
+		// no position number
+		{"bray/feat-schema", "bray", false, "", 0, ""},
+		// trunk branch
+		{"main", "bray", false, "", 0, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.branch, func(t *testing.T) {
+			got, ok := parseStackBranch(tc.branch, tc.user)
+			if ok != tc.wantOK {
+				t.Fatalf("ok=%v want %v", ok, tc.wantOK)
+			}
+			if !ok {
+				return
+			}
+			if got.baseSlug != tc.wantBase || got.position != tc.wantPos || got.taskSlug != tc.wantTask {
+				t.Errorf("got {%q %d %q}, want {%q %d %q}",
+					got.baseSlug, got.position, got.taskSlug,
+					tc.wantBase, tc.wantPos, tc.wantTask)
+			}
+		})
+	}
+}
+
 func mustOutput(t *testing.T, dir, name string, args ...string) string {
 	t.Helper()
 	cmd := commandFor(dir, name, args...)
