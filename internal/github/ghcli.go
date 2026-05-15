@@ -83,6 +83,26 @@ func (c *GhCli) ListOpenPRs(_ context.Context) ([]PullRequest, error) {
 	return prs, nil
 }
 
+func (c *GhCli) ListAllOpenPRs(_ context.Context) ([]PullRequest, error) {
+	out, err := c.run("gh", "pr", "list",
+		"--state", "open",
+		"--limit", "100",
+		"--json", prJSONFields,
+	)
+	if err != nil {
+		return nil, wrapGhErr(err, "gh pr list --state open")
+	}
+	var raw []ghPRRaw
+	if err := json.Unmarshal(out, &raw); err != nil {
+		return nil, fmt.Errorf("parse gh pr list: %w", err)
+	}
+	prs := make([]PullRequest, len(raw))
+	for i, r := range raw {
+		prs[i] = r.toPR()
+	}
+	return prs, nil
+}
+
 func (c *GhCli) ListMergedPRsByHead(_ context.Context, heads []string) ([]PullRequest, error) {
 	out := make([]PullRequest, 0, len(heads))
 	for _, head := range heads {

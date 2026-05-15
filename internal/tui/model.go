@@ -13,10 +13,12 @@ type Layer struct {
 	Stack     string `json:"stack"`
 	Position  int    `json:"position"`
 	Branch    string `json:"branch"`
+	Title     string `json:"title"` // PR title (shown in --all mode)
 	PRNumber  int    `json:"pr_number"`
 	PRState   string `json:"pr_state"` // "OPEN", "MERGED", or ""
 	IsCurrent bool   `json:"is_current"`
 	NeedsSync bool   `json:"needs_sync"`
+	Depth     int    `json:"depth"` // nesting depth for tree view (--all mode)
 }
 
 // PendingAction is an action the user triggered that the caller should run
@@ -134,35 +136,42 @@ func (m Model) View() string {
 
 		sel := i == m.Cursor
 
-		// cursor marker
+		// tree indent for --all mode
+		indent := strings.Repeat("   ", l.Depth)
+		connector := ""
+		if l.Depth > 0 {
+			connector = styleFaint.Render("└── ")
+		}
+
+		// cursor / current marker
+		var marker string
 		if sel {
-			b.WriteString(styleSelBold.Render(" ❯ "))
+			marker = styleSelBold.Render(" ❯ ")
 		} else if l.IsCurrent {
-			b.WriteString(styleCurrent.Render(" ▶ "))
+			marker = styleCurrent.Render(" ▶ ")
 		} else {
-			b.WriteString("   ")
+			marker = "   "
 		}
+		b.WriteString(marker + indent + connector)
 
-		// position
-		posStr := fmt.Sprintf("%d  ", l.Position)
-		if sel {
-			b.WriteString(styleSelPos.Render(posStr))
-		} else {
-			b.WriteString(styleFaint.Render(posStr))
+		// label: prefer title in tree mode, branch name in stack mode
+		label := l.Branch
+		if l.Title != "" && l.Depth >= 0 {
+			label = l.Title
 		}
-
-		// branch name
-		name := l.Branch
+		maxLabel := 42 - l.Depth*3
+		if len(label) > maxLabel && maxLabel > 8 {
+			label = label[:maxLabel-1] + "…"
+		}
 		if sel {
-			b.WriteString(styleSelBold.Render(name))
+			b.WriteString(styleSelBold.Render(label))
 		} else if l.IsCurrent {
-			b.WriteString(styleCurrent.Render(name))
+			b.WriteString(styleCurrent.Render(label))
 		} else {
-			b.WriteString(name)
+			b.WriteString(label)
 		}
 
-		// padding to align PR info
-		pad := 44 - len(name)
+		pad := maxLabel - len([]rune(label)) + 2
 		if pad < 2 {
 			pad = 2
 		}

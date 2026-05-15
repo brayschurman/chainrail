@@ -5,6 +5,9 @@ import "context"
 type GitHubClient interface {
 	CurrentUser(ctx context.Context) (string, error)
 	ListOpenPRs(ctx context.Context) ([]PullRequest, error)
+	// ListAllOpenPRs returns all open PRs in the repo regardless of author.
+	// Used by cn status --all to build the full PR dependency graph.
+	ListAllOpenPRs(ctx context.Context) ([]PullRequest, error)
 	// ListMergedPRsByHead returns at most one merged PR per head (the most recent
 	// by number when there are duplicates). Heads that have no merged PR are
 	// simply absent from the result. Used by sync's squash-merged-parent detection.
