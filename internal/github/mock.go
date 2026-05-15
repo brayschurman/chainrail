@@ -49,6 +49,17 @@ func (m *MockGhClient) ListOpenPRs(_ context.Context) ([]PullRequest, error) {
 	return out, nil
 }
 
+func (m *MockGhClient) ListAllOpenPRs(_ context.Context) ([]PullRequest, error) {
+	m.record("ListAllOpenPRs")
+	out := make([]PullRequest, 0, len(m.PRs))
+	for _, pr := range m.PRs {
+		if pr.State == "OPEN" {
+			out = append(out, pr)
+		}
+	}
+	return out, nil
+}
+
 func (m *MockGhClient) ListMergedPRsByHead(_ context.Context, heads []string) ([]PullRequest, error) {
 	m.record(fmt.Sprintf("ListMergedPRsByHead(%v)", heads))
 	headSet := make(map[string]bool, len(heads))

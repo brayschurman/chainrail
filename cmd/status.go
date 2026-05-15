@@ -24,19 +24,26 @@ type statusDeps struct {
 	gh  github.GitHubClient
 }
 
-var statusJSONFlag bool
+var (
+	statusJSONFlag bool
+	statusAllFlag  bool
+)
 
 var statusCmd = &cobra.Command{
 	Use:   "status",
 	Short: "Show stack health — works from any branch",
-	Args:  cobra.NoArgs,
+	Long: `Show your stack health in an interactive TUI.
+
+Use --all to see every open PR in the repo as a dependency chain,
+without needing chainrail to be initialized first.`,
+	Args: cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		cwd, err := os.Getwd()
 		if err != nil {
 			return err
 		}
 		r := output.NewTextRenderer(term.IsTTY(cmd.OutOrStdout()))
-		return runStatus(cmd.OutOrStdout(), r, statusJSONFlag, statusDeps{
+		return runStatus(cmd.OutOrStdout(), r, statusJSONFlag, statusAllFlag, statusDeps{
 			cwd: cwd,
 			gh:  github.New(),
 		})
@@ -45,6 +52,7 @@ var statusCmd = &cobra.Command{
 
 func init() {
 	statusCmd.Flags().BoolVar(&statusJSONFlag, "json", false, "output as JSON instead of TUI")
+	statusCmd.Flags().BoolVarP(&statusAllFlag, "all", "a", false, "show all open PRs as a dependency chain (no cn init required)")
 	rootCmd.AddCommand(statusCmd)
 }
 
@@ -52,8 +60,40 @@ type statusOutput struct {
 	Layers []tui.Layer `json:"layers"`
 }
 
-func runStatus(out io.Writer, r output.Renderer, asJSON bool, deps statusDeps) error {
+func runStatus(out io.Writer, r output.Renderer, asJSON, allPRs bool, deps statusDeps) error {
 	ctx := context.Background()
+
+	if allPRs {
+		return runStatusAll(ctx, out, r, asJSON, deps)
+	}
+	return runStatusStack(ctx, out, r, asJSON, deps)
+}
+
+// runStatusAll fetches every open PR and visualises the full dependency graph.
+// Works without cn init.
+func runStatusAll(ctx context.Context, out io.Writer, r output.Renderer, asJSON bool, deps statusDeps) error {
+	g := git.New(deps.cwd)
+	currentBranch := ""
+	if g.IsInsideRepo() {
+		currentBranch, _ = g.CurrentBranch()
+	}
+
+	prs, err := deps.gh.ListAllOpenPRs(ctx)
+	if err != nil {
+		return err
+	}
+
+	layers := buildPRTree(prs, currentBranch)
+
+	if asJSON {
+		return json.NewEncoder(out).Encode(statusOutput{Layers: layers})
+	}
+
+	return launchTUI(out, r, layers, deps)
+}
+
+// runStatusStack shows chainrail-managed stacks for the current repo.
+func runStatusStack(ctx context.Context, out io.Writer, r output.Renderer, asJSON bool, deps statusDeps) error {
 	g := git.New(deps.cwd)
 
 	if !g.IsInsideRepo() {
@@ -65,11 +105,12 @@ func runStatus(out io.Writer, r output.Renderer, asJSON bool, deps statusDeps) e
 
 	trunk, err := g.ConfigGet(trunkConfigKey)
 	if err != nil || trunk == "" {
-		return &crerrors.ChainrailError{
-			Code:       crerrors.CodeTrunkMissing,
-			Message:    "chainrail is not initialized in this repository",
-			Suggestion: "run 'chainrail init --base <trunk>' first",
-		}
+		// Friendly nudge instead of a hard error.
+		fmt.Fprintln(out, "chainrail isn't set up in this repo yet.")
+		fmt.Fprintln(out)
+		fmt.Fprintln(out, "  Run 'cn init --base <trunk>' to start managing stacked PRs.")
+		fmt.Fprintln(out, "  Or run 'cn status --all' to see all open PRs in this repo.")
+		return nil
 	}
 
 	user, err := deps.gh.CurrentUser(ctx)
@@ -87,18 +128,8 @@ func runStatus(out io.Writer, r output.Renderer, asJSON bool, deps statusDeps) e
 		return err
 	}
 
-	// Discover every stack this user has locally, grouped by base slug.
 	allStacks := discoverAllStacks(user, localBranches)
-	if len(allStacks) == 0 {
-		if asJSON {
-			return json.NewEncoder(out).Encode(statusOutput{Layers: []tui.Layer{}})
-		}
-		m := tui.Model{}
-		tea.NewProgram(m).Run() //nolint — empty state renders the "no stacks" hint
-		return nil
-	}
 
-	// Collect all candidate parent branches across all stacks for merged-PR lookup.
 	var allParents []string
 	for _, branches := range allStacks {
 		if len(branches) > 1 {
@@ -124,7 +155,6 @@ func runStatus(out io.Writer, r output.Renderer, asJSON bool, deps statusDeps) e
 		mergedByHead[pr.HeadRefName] = pr
 	}
 
-	// Build a flat, sorted layer list across all stacks.
 	slugs := make([]string, 0, len(allStacks))
 	for slug := range allStacks {
 		slugs = append(slugs, slug)
@@ -144,21 +174,30 @@ func runStatus(out io.Writer, r output.Renderer, asJSON bool, deps statusDeps) e
 			if pr, ok := openByHead[branch]; ok {
 				l.PRNumber = pr.Number
 				l.PRState = "OPEN"
+				l.Title = pr.Title
 				_, parentMerged := resolveEffectiveParent(i, branches, mergedByHead, openByHead, trunk)
 				l.NeedsSync = parentMerged
 			} else if pr, ok := mergedByHead[branch]; ok {
 				l.PRNumber = pr.Number
 				l.PRState = "MERGED"
+				l.Title = pr.Title
 			}
 			layers = append(layers, l)
 		}
+	}
+
+	if len(layers) == 0 {
+		// No local stack branches — fall through to empty TUI hint.
 	}
 
 	if asJSON {
 		return json.NewEncoder(out).Encode(statusOutput{Layers: layers})
 	}
 
-	// Default cursor to current branch, or 0.
+	return launchTUI(out, r, layers, deps)
+}
+
+func launchTUI(out io.Writer, r output.Renderer, layers []tui.Layer, deps statusDeps) error {
 	cursor := 0
 	for i, l := range layers {
 		if l.IsCurrent {
@@ -174,13 +213,10 @@ func runStatus(out io.Writer, r output.Renderer, asJSON bool, deps statusDeps) e
 		return fmt.Errorf("TUI error: %w", err)
 	}
 
-	result := final.(tui.Model).Result()
-	return executeStatusAction(out, r, result, deps)
+	return executeStatusAction(out, r, final.(tui.Model).Result(), deps)
 }
 
 func executeStatusAction(out io.Writer, r output.Renderer, result tui.Result, deps statusDeps) error {
-	ctx := context.Background()
-
 	switch result.Action {
 	case tui.ActionCheckout:
 		g := git.New(deps.cwd)
@@ -212,14 +248,65 @@ func executeStatusAction(out io.Writer, r output.Renderer, result tui.Result, de
 		}
 		submitR := output.NewTextRenderer(term.IsTTY(out))
 		return runSubmit(out, submitR, submitDeps{cwd: deps.cwd, gh: deps.gh})
-
-	case tui.ActionNone:
-		// user just quit
-
-	default:
-		_ = ctx // keep import
 	}
 	return nil
+}
+
+// buildPRTree takes all open PRs and arranges them as a depth-first tree
+// rooted at branches that aren't the head of another open PR.
+func buildPRTree(prs []github.PullRequest, currentBranch string) []tui.Layer {
+	if len(prs) == 0 {
+		return nil
+	}
+
+	// Index: headRefName → PR
+	headSet := make(map[string]bool, len(prs))
+	for _, pr := range prs {
+		headSet[pr.HeadRefName] = true
+	}
+
+	// Children: baseRef → []PR (sorted by number)
+	children := make(map[string][]github.PullRequest)
+	for _, pr := range prs {
+		children[pr.BaseRefName] = append(children[pr.BaseRefName], pr)
+	}
+	for k := range children {
+		sort.Slice(children[k], func(i, j int) bool {
+			return children[k][i].Number < children[k][j].Number
+		})
+	}
+
+	// Roots: PRs whose base isn't another open PR's head.
+	var roots []github.PullRequest
+	for _, pr := range prs {
+		if !headSet[pr.BaseRefName] {
+			roots = append(roots, pr)
+		}
+	}
+	sort.Slice(roots, func(i, j int) bool { return roots[i].Number < roots[j].Number })
+
+	// Group roots by their base branch (trunk) for the Stack header.
+	var layers []tui.Layer
+	var walk func(pr github.PullRequest, depth int, stack string)
+	walk = func(pr github.PullRequest, depth int, stack string) {
+		layers = append(layers, tui.Layer{
+			Stack:     stack,
+			Branch:    pr.HeadRefName,
+			Title:     pr.Title,
+			PRNumber:  pr.Number,
+			PRState:   pr.State,
+			IsCurrent: pr.HeadRefName == currentBranch,
+			Depth:     depth,
+		})
+		for _, child := range children[pr.HeadRefName] {
+			walk(child, depth+1, stack)
+		}
+	}
+
+	for _, root := range roots {
+		walk(root, 0, root.BaseRefName)
+	}
+	return layers
 }
 
 // discoverAllStacks finds every chainrail stack branch for this user in the
