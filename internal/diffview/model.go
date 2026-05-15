@@ -33,6 +33,16 @@ type Model struct {
 	// at load time. Populated by ensureDetectors.
 	CISignals map[string]CISignal
 
+	// DupeSignals records possible-duplicate symbol findings per file.
+	// Computed once after the Files slice is set when a repo root is
+	// available. Empty when no repo root is configured (test contexts).
+	DupeSignals map[string]DupeSignal
+
+	// RepoRoot is the local filesystem path of the repo, used by the
+	// duplicate-detector's git grep. Optional; when unset, dupe detection
+	// is skipped.
+	RepoRoot string
+
 	// displayOrder is the index permutation that re-orders Files so CI-
 	// touching files come first. Computed once, used by all sidebar render
 	// paths. Empty until ensureDisplayOrder runs.
@@ -175,6 +185,29 @@ func (m *Model) runDetectors() {
 	for _, f := range m.Files {
 		if sig := DetectCIRisk(f.Path, f.Lines); sig.Risk > CIRiskNone {
 			m.CISignals[f.Path] = sig
+		}
+	}
+}
+
+// runRepoDetectors runs detectors that need filesystem access (i.e. git grep
+// for dupe detection). Called by the caller (cmd/view.go) after it discovers
+// the repo root, since the diffview package doesn't shell out by itself in
+// the New constructor.
+func (m *Model) RunRepoDetectors() {
+	if m.RepoRoot == "" {
+		return
+	}
+	if m.DupeSignals == nil {
+		m.DupeSignals = map[string]DupeSignal{}
+	}
+	excluded := make(map[string]bool, len(m.Files))
+	for _, f := range m.Files {
+		excluded[f.Path] = true
+	}
+	for _, f := range m.Files {
+		sig := DetectDupes(f.Path, f.Lines, m.RepoRoot, excluded)
+		if len(sig.Findings) > 0 {
+			m.DupeSignals[f.Path] = sig
 		}
 	}
 }
@@ -461,6 +494,10 @@ func (m Model) buildSidebarRows(w int) []string {
 			ciMark = styleCIBlock.Render("🚨")
 		case CIRiskConfig:
 			ciMark = styleCIWarn.Render("⚠ ")
+		default:
+			if len(m.DupeSignals[f.Path].Findings) > 0 {
+				ciMark = styleCIWarn.Render("↻ ")
+			}
 		}
 		row := fmt.Sprintf(" %s %s %s %-*s %s",
 			selectionMarker(i == m.cursor),
