@@ -11,6 +11,7 @@ import (
 	"github.com/alecthomas/chroma/v2/formatters"
 	"github.com/alecthomas/chroma/v2/lexers"
 	"github.com/alecthomas/chroma/v2/styles"
+	"github.com/charmbracelet/lipgloss"
 )
 
 // Highlighter colorizes diff content lines using chroma based on file
@@ -60,6 +61,45 @@ func (h *Highlighter) Highlight(path, src string) string {
 	// chroma's terminal256 formatter sometimes appends a trailing newline;
 	// strip it so we don't corrupt the row.
 	return strings.TrimRight(buf.String(), "\n")
+}
+
+// HighlightWithBg tokenises src with the lexer for path and renders each
+// token with both its syntax foreground AND the given diff background. This
+// gives the hunk/diffs.com look where chroma's colors stay vivid on top of a
+// soft +/- tint, without relying on fragile mid-stream ANSI rewriting.
+//
+// Returns src wrapped in a single bg style if no lexer matches or
+// highlighting is disabled. The caller is responsible for any extra padding
+// needed to reach a target pane width.
+func (h *Highlighter) HighlightWithBg(path, src string, bg lipgloss.Color) string {
+	if h == nil || !h.enabled || src == "" {
+		return lipgloss.NewStyle().Background(bg).Render(src)
+	}
+	lex := h.lexerFor(path)
+	if lex == nil {
+		return lipgloss.NewStyle().Background(bg).Render(src)
+	}
+	it, err := lex.Tokenise(nil, src)
+	if err != nil {
+		return lipgloss.NewStyle().Background(bg).Render(src)
+	}
+
+	var b strings.Builder
+	for tok := it(); tok != chroma.EOF; tok = it() {
+		entry := h.style.Get(tok.Type)
+		st := lipgloss.NewStyle().Background(bg)
+		if entry.Colour.IsSet() {
+			st = st.Foreground(lipgloss.Color(entry.Colour.String()))
+		}
+		if entry.Bold == chroma.Yes {
+			st = st.Bold(true)
+		}
+		if entry.Italic == chroma.Yes {
+			st = st.Italic(true)
+		}
+		b.WriteString(st.Render(tok.Value))
+	}
+	return b.String()
 }
 
 func (h *Highlighter) lexerFor(path string) chroma.Lexer {

@@ -421,12 +421,15 @@ func (m Model) renderFileLines(f File, w int) []string {
 // styledRow renders one content row of the diff: line-number gutter on the
 // left, then the line itself with a subtle background tint by kind. Old / new
 // number columns are 4 chars each; pass 0 to render that column as blanks.
+//
+// Chroma highlights each token with both its syntax fg AND the diff bg, so
+// the syntax coloring stays vivid on top of the tinted row.
 func (m Model) styledRow(l Line, path string, oldNo, newNo, w int) string {
-	body := m.highlightForBg(path, stripMarker(l.Text))
-
+	body := stripMarker(l.Text)
 	gutterText := fmt.Sprintf("%s %s ", numCol(oldNo), numCol(newNo))
 
 	var gutterStyle, lineStyle, markerStyle lipgloss.Style
+	var bg lipgloss.Color
 	var marker string
 
 	switch l.Kind {
@@ -434,16 +437,19 @@ func (m Model) styledRow(l Line, path string, oldNo, newNo, w int) string {
 		gutterStyle = styleAddGut
 		lineStyle = styleAddLine
 		markerStyle = styleAddMark
+		bg = bgAdd
 		marker = "+"
 	case LineDel:
 		gutterStyle = styleDelGut
 		lineStyle = styleDelLine
 		markerStyle = styleDelMark
+		bg = bgDel
 		marker = "-"
 	default:
 		gutterStyle = styleGutter
 		lineStyle = stylePaneBg
 		markerStyle = styleGutter
+		bg = bgPane
 		marker = " "
 	}
 
@@ -453,8 +459,19 @@ func (m Model) styledRow(l Line, path string, oldNo, newNo, w int) string {
 	if contentW < 1 {
 		contentW = 1
 	}
-	content := lineStyle.Width(contentW).Render(body)
-	return gutter + mark + content
+
+	// Token-level highlighting: chroma + bg composed per span, not layered
+	// after the fact. Pad the right side with bg-tinted spaces to fill width.
+	highlighted := m.highlighter.HighlightWithBg(path, body, bg)
+	bodyW := lipgloss.Width(highlighted)
+	padN := contentW - bodyW
+	if padN < 0 {
+		padN = 0
+		// Body is wider than pane — defer to lipgloss.Width to truncate via
+		// Render's Width clamp. (Long-line handling is its own ticket.)
+	}
+	pad := lineStyle.Render(strings.Repeat(" ", padN))
+	return gutter + mark + highlighted + pad
 }
 
 // styledRowSpans renders a paired +/- line using word-level spans. Unchanged
@@ -555,19 +572,6 @@ func parseHunkStart(s string) (int, int) {
 		}
 	}
 	return oldStart, newStart
-}
-
-// highlightForBg runs chroma on the body, then strips ANSI resets so the
-// outer lipgloss background color isn't broken mid-line.
-func (m Model) highlightForBg(path, src string) string {
-	if m.highlighter == nil {
-		return src
-	}
-	out := m.highlighter.Highlight(path, src)
-	// chroma's terminal256 formatter can emit \x1b[0m which resets bg too.
-	// Replace with a "default fg" reset (39m) so our bg survives.
-	out = strings.ReplaceAll(out, "\x1b[0m", "\x1b[39m")
-	return out
 }
 
 func stripMarker(text string) string {
