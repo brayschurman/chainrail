@@ -129,6 +129,60 @@ func TestGhCli_CreatePR(t *testing.T) {
 	}
 }
 
+func TestGhCli_ListOpenPRs_ParsesCIAndReview(t *testing.T) {
+	cli := newFakeCli(t, map[string][]byte{
+		"gh pr list": []byte(`[
+{"number":1,"title":"a","baseRefName":"main","headRefName":"feat/a","state":"OPEN","body":"","mergeCommit":null,"statusCheckRollup":[{"status":"COMPLETED","conclusion":"SUCCESS"}],"reviewDecision":"APPROVED","updatedAt":"2026-05-14T10:00:00Z"},
+{"number":2,"title":"b","baseRefName":"main","headRefName":"feat/b","state":"OPEN","body":"","mergeCommit":null,"statusCheckRollup":[{"status":"COMPLETED","conclusion":"FAILURE"},{"status":"COMPLETED","conclusion":"SUCCESS"}],"reviewDecision":"REVIEW_REQUIRED","updatedAt":"2026-05-13T10:00:00Z"},
+{"number":3,"title":"c","baseRefName":"main","headRefName":"feat/c","state":"OPEN","body":"","mergeCommit":null,"statusCheckRollup":[{"status":"IN_PROGRESS","conclusion":""}],"reviewDecision":"CHANGES_REQUESTED","updatedAt":"2026-05-12T10:00:00Z"},
+{"number":4,"title":"d","baseRefName":"main","headRefName":"feat/d","state":"OPEN","body":"","mergeCommit":null,"statusCheckRollup":[],"reviewDecision":"","updatedAt":""}
+]`),
+	})
+	prs, err := cli.ListOpenPRs(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(prs) != 4 {
+		t.Fatalf("got %d prs, want 4", len(prs))
+	}
+	cases := []struct {
+		num    int
+		ci     string
+		review string
+	}{
+		{1, "SUCCESS", "APPROVED"},
+		{2, "FAILURE", "REVIEW_REQUIRED"},
+		{3, "PENDING", "CHANGES_REQUESTED"},
+		{4, "", ""},
+	}
+	for i, c := range cases {
+		if prs[i].CIStatus != c.ci {
+			t.Errorf("pr %d: CIStatus = %q, want %q", c.num, prs[i].CIStatus, c.ci)
+		}
+		if prs[i].ReviewDecision != c.review {
+			t.Errorf("pr %d: ReviewDecision = %q, want %q", c.num, prs[i].ReviewDecision, c.review)
+		}
+	}
+	if prs[0].UpdatedAt != "2026-05-14T10:00:00Z" {
+		t.Errorf("UpdatedAt: got %q", prs[0].UpdatedAt)
+	}
+}
+
+func TestGhCli_UpdatePRTitle(t *testing.T) {
+	var got []string
+	cli := &GhCli{run: func(name string, args ...string) ([]byte, error) {
+		got = append([]string{name}, args...)
+		return nil, nil
+	}}
+	if err := cli.UpdatePRTitle(context.Background(), 42, "polished title"); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"gh", "pr", "edit", "42", "--title", "polished title"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %v want %v", got, want)
+	}
+}
+
 func TestGhCli_UpdatePRBody(t *testing.T) {
 	var got []string
 	cli := &GhCli{run: func(name string, args ...string) ([]byte, error) {

@@ -175,12 +175,16 @@ func runStatusStack(ctx context.Context, out io.Writer, r output.Renderer, asJSO
 				l.PRNumber = pr.Number
 				l.PRState = "OPEN"
 				l.Title = pr.Title
+				l.CIStatus = pr.CIStatus
+				l.ReviewDecision = pr.ReviewDecision
+				l.UpdatedAt = pr.UpdatedAt
 				_, parentMerged := resolveEffectiveParent(i, branches, mergedByHead, openByHead, trunk)
 				l.NeedsSync = parentMerged
 			} else if pr, ok := mergedByHead[branch]; ok {
 				l.PRNumber = pr.Number
 				l.PRState = "MERGED"
 				l.Title = pr.Title
+				l.UpdatedAt = pr.UpdatedAt
 			}
 			layers = append(layers, l)
 		}
@@ -194,19 +198,81 @@ func runStatusStack(ctx context.Context, out io.Writer, r output.Renderer, asJSO
 		return json.NewEncoder(out).Encode(statusOutput{Layers: layers})
 	}
 
-	return launchTUI(out, r, layers, deps)
+	// Build the Review and All tabs alongside Mine. Best-effort: failures here
+	// leave the tab empty rather than blocking the TUI.
+	reviewLayers := buildReviewLayers(ctx, deps.gh, currentBranch)
+	allLayers := buildAllLayers(ctx, deps.gh, currentBranch)
+
+	tabs := []tui.Tab{
+		{Label: "Mine", Layers: layers},
+		{Label: "Review", Layers: reviewLayers},
+		{Label: "All", Layers: allLayers},
+	}
+
+	return launchTUIWithTabs(out, r, tabs, 0, deps)
+}
+
+// buildReviewLayers returns one Layer per PR where the current user is a
+// requested reviewer. Returns nil on error.
+func buildReviewLayers(ctx context.Context, gh github.GitHubClient, currentBranch string) []tui.Layer {
+	prs, err := gh.ListReviewRequestedPRs(ctx)
+	if err != nil || len(prs) == 0 {
+		return nil
+	}
+	sort.Slice(prs, func(i, j int) bool { return prs[i].Number < prs[j].Number })
+	out := make([]tui.Layer, len(prs))
+	for i, pr := range prs {
+		out[i] = tui.Layer{
+			Stack:          pr.BaseRefName,
+			Branch:         pr.HeadRefName,
+			Title:          pr.Title,
+			PRNumber:       pr.Number,
+			PRState:        pr.State,
+			CIStatus:       pr.CIStatus,
+			ReviewDecision: pr.ReviewDecision,
+			UpdatedAt:      pr.UpdatedAt,
+			IsCurrent:      pr.HeadRefName == currentBranch,
+		}
+	}
+	return out
+}
+
+func buildAllLayers(ctx context.Context, gh github.GitHubClient, currentBranch string) []tui.Layer {
+	prs, err := gh.ListAllOpenPRs(ctx)
+	if err != nil {
+		return nil
+	}
+	return buildPRTree(prs, currentBranch)
 }
 
 func launchTUI(out io.Writer, r output.Renderer, layers []tui.Layer, deps statusDeps) error {
-	cursor := 0
-	for i, l := range layers {
-		if l.IsCurrent {
-			cursor = i
-			break
+	return launchTUIWithTabs(out, r, []tui.Tab{{Label: "All", Layers: layers}}, 0, deps)
+}
+
+func launchTUIWithTabs(out io.Writer, r output.Renderer, tabs []tui.Tab, active int, deps statusDeps) error {
+	// Seed each tab's cursor at its current branch row, if any.
+	for ti, tab := range tabs {
+		for i, l := range tab.Layers {
+			if l.IsCurrent {
+				tabs[ti].Cursor = i
+				break
+			}
 		}
 	}
 
-	m := tui.Model{Layers: layers, Cursor: cursor}
+	// If only one tab is in play, drop the tab bar — keeps the simple-case UX.
+	var modelTabs []tui.Tab
+	if len(tabs) > 1 {
+		modelTabs = tabs
+	}
+
+	m := tui.Model{
+		Layers:    tabs[active].Layers,
+		Cursor:    tabs[active].Cursor,
+		Tabs:      modelTabs,
+		ActiveTab: active,
+		Updater:   deps.gh.UpdatePRTitle,
+	}
 	p := tea.NewProgram(m)
 	final, err := p.Run()
 	if err != nil {
@@ -290,13 +356,16 @@ func buildPRTree(prs []github.PullRequest, currentBranch string) []tui.Layer {
 	var walk func(pr github.PullRequest, depth int, stack string)
 	walk = func(pr github.PullRequest, depth int, stack string) {
 		layers = append(layers, tui.Layer{
-			Stack:     stack,
-			Branch:    pr.HeadRefName,
-			Title:     pr.Title,
-			PRNumber:  pr.Number,
-			PRState:   pr.State,
-			IsCurrent: pr.HeadRefName == currentBranch,
-			Depth:     depth,
+			Stack:          stack,
+			Branch:         pr.HeadRefName,
+			Title:          pr.Title,
+			PRNumber:       pr.Number,
+			PRState:        pr.State,
+			CIStatus:       pr.CIStatus,
+			ReviewDecision: pr.ReviewDecision,
+			UpdatedAt:      pr.UpdatedAt,
+			IsCurrent:      pr.HeadRefName == currentBranch,
+			Depth:          depth,
 		})
 		for _, child := range children[pr.HeadRefName] {
 			walk(child, depth+1, stack)
@@ -354,11 +423,15 @@ func buildLayers(
 		if pr, ok := openByHead[branch]; ok {
 			l.PRNumber = pr.Number
 			l.PRState = "OPEN"
+			l.CIStatus = pr.CIStatus
+			l.ReviewDecision = pr.ReviewDecision
+			l.UpdatedAt = pr.UpdatedAt
 			_, parentMerged := resolveEffectiveParent(i, chainBranches, mergedByHead, openByHead, trunk)
 			l.NeedsSync = parentMerged
 		} else if pr, ok := mergedByHead[branch]; ok {
 			l.PRNumber = pr.Number
 			l.PRState = "MERGED"
+			l.UpdatedAt = pr.UpdatedAt
 		}
 		layers[i] = l
 	}

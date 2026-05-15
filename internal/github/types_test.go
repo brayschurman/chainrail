@@ -48,11 +48,13 @@ type interfaceShape interface {
 	CurrentUser(ctx context.Context) (string, error)
 	ListOpenPRs(ctx context.Context) ([]PullRequest, error)
 	ListAllOpenPRs(ctx context.Context) ([]PullRequest, error)
+	ListReviewRequestedPRs(ctx context.Context) ([]PullRequest, error)
 	ListMergedPRsByHead(ctx context.Context, heads []string) ([]PullRequest, error)
 	GetPR(ctx context.Context, number int) (PullRequest, error)
 	CreatePR(ctx context.Context, p NewPR) (PullRequest, error)
 	UpdatePRBody(ctx context.Context, number int, body string) error
 	UpdatePRBase(ctx context.Context, number int, newBase string) error
+	UpdatePRTitle(ctx context.Context, number int, newTitle string) error
 }
 
 func TestGitHubClientInterfaceShape(t *testing.T) {

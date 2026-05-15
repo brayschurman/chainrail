@@ -6,10 +6,11 @@ import (
 )
 
 type MockGhClient struct {
-	User    string
-	PRs     map[int]PullRequest
-	NextNum int
-	Calls   []string
+	User            string
+	PRs             map[int]PullRequest
+	NextNum         int
+	Calls           []string
+	reviewRequested map[int]bool
 }
 
 func NewMock() *MockGhClient {
@@ -54,6 +55,25 @@ func (m *MockGhClient) ListAllOpenPRs(_ context.Context) ([]PullRequest, error) 
 	out := make([]PullRequest, 0, len(m.PRs))
 	for _, pr := range m.PRs {
 		if pr.State == "OPEN" {
+			out = append(out, pr)
+		}
+	}
+	return out, nil
+}
+
+// ReviewRequested holds PR numbers where the mock user is a requested reviewer.
+func (m *MockGhClient) SetReviewRequested(numbers ...int) {
+	m.reviewRequested = map[int]bool{}
+	for _, n := range numbers {
+		m.reviewRequested[n] = true
+	}
+}
+
+func (m *MockGhClient) ListReviewRequestedPRs(_ context.Context) ([]PullRequest, error) {
+	m.record("ListReviewRequestedPRs")
+	out := make([]PullRequest, 0, len(m.PRs))
+	for num, pr := range m.PRs {
+		if pr.State == "OPEN" && m.reviewRequested[num] {
 			out = append(out, pr)
 		}
 	}
@@ -121,6 +141,17 @@ func (m *MockGhClient) UpdatePRBody(_ context.Context, number int, body string) 
 		return fmt.Errorf("mock: PR #%d not found", number)
 	}
 	pr.Body = body
+	m.PRs[number] = pr
+	return nil
+}
+
+func (m *MockGhClient) UpdatePRTitle(_ context.Context, number int, newTitle string) error {
+	m.record(fmt.Sprintf("UpdatePRTitle(%d,%s)", number, newTitle))
+	pr, ok := m.PRs[number]
+	if !ok {
+		return fmt.Errorf("mock: PR #%d not found", number)
+	}
+	pr.Title = newTitle
 	m.PRs[number] = pr
 	return nil
 }

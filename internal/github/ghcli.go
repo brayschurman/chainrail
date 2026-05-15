@@ -44,16 +44,26 @@ type ghPRRaw struct {
 	MergeCommit *struct {
 		OID string `json:"oid"`
 	} `json:"mergeCommit"`
+	StatusCheckRollup []struct {
+		Status     string `json:"status"`
+		Conclusion string `json:"conclusion"`
+		State      string `json:"state"`
+	} `json:"statusCheckRollup"`
+	ReviewDecision string `json:"reviewDecision"`
+	UpdatedAt      string `json:"updatedAt"`
 }
 
 func (r ghPRRaw) toPR() PullRequest {
 	pr := PullRequest{
-		Number:      r.Number,
-		Title:       r.Title,
-		BaseRefName: r.BaseRefName,
-		HeadRefName: r.HeadRefName,
-		State:       r.State,
-		Body:        r.Body,
+		Number:         r.Number,
+		Title:          r.Title,
+		BaseRefName:    r.BaseRefName,
+		HeadRefName:    r.HeadRefName,
+		State:          r.State,
+		Body:           r.Body,
+		CIStatus:       rollupCIStatus(r.StatusCheckRollup),
+		ReviewDecision: r.ReviewDecision,
+		UpdatedAt:      r.UpdatedAt,
 	}
 	if r.MergeCommit != nil {
 		pr.MergeCommitSHA = r.MergeCommit.OID
@@ -61,7 +71,51 @@ func (r ghPRRaw) toPR() PullRequest {
 	return pr
 }
 
-const prJSONFields = "number,title,baseRefName,headRefName,state,body,mergeCommit"
+// rollupCIStatus collapses gh's per-check statusCheckRollup array into a
+// single value: FAILURE if any check failed, PENDING if any is still running,
+// SUCCESS if all completed successfully, "" if no checks are configured.
+func rollupCIStatus(checks []struct {
+	Status     string `json:"status"`
+	Conclusion string `json:"conclusion"`
+	State      string `json:"state"`
+}) string {
+	if len(checks) == 0 {
+		return ""
+	}
+	anyPending := false
+	anyFail := false
+	for _, c := range checks {
+		// Check runs use Status (COMPLETED/IN_PROGRESS/QUEUED) + Conclusion
+		// (SUCCESS/FAILURE/...). Status contexts use State (SUCCESS/FAILURE/
+		// PENDING/ERROR).
+		status := strings.ToUpper(c.Status)
+		concl := strings.ToUpper(c.Conclusion)
+		state := strings.ToUpper(c.State)
+		if status != "" && status != "COMPLETED" {
+			anyPending = true
+			continue
+		}
+		if state == "PENDING" {
+			anyPending = true
+			continue
+		}
+		if concl == "FAILURE" || concl == "TIMED_OUT" || concl == "CANCELLED" || concl == "ACTION_REQUIRED" {
+			anyFail = true
+		}
+		if state == "FAILURE" || state == "ERROR" {
+			anyFail = true
+		}
+	}
+	if anyFail {
+		return "FAILURE"
+	}
+	if anyPending {
+		return "PENDING"
+	}
+	return "SUCCESS"
+}
+
+const prJSONFields = "number,title,baseRefName,headRefName,state,body,mergeCommit,statusCheckRollup,reviewDecision,updatedAt"
 
 func (c *GhCli) ListOpenPRs(_ context.Context) ([]PullRequest, error) {
 	out, err := c.run("gh", "pr", "list",
@@ -95,6 +149,26 @@ func (c *GhCli) ListAllOpenPRs(_ context.Context) ([]PullRequest, error) {
 	var raw []ghPRRaw
 	if err := json.Unmarshal(out, &raw); err != nil {
 		return nil, fmt.Errorf("parse gh pr list: %w", err)
+	}
+	prs := make([]PullRequest, len(raw))
+	for i, r := range raw {
+		prs[i] = r.toPR()
+	}
+	return prs, nil
+}
+
+func (c *GhCli) ListReviewRequestedPRs(_ context.Context) ([]PullRequest, error) {
+	out, err := c.run("gh", "pr", "list",
+		"--search", "is:open review-requested:@me",
+		"--limit", "100",
+		"--json", prJSONFields,
+	)
+	if err != nil {
+		return nil, wrapGhErr(err, "gh pr list --search review-requested:@me")
+	}
+	var raw []ghPRRaw
+	if err := json.Unmarshal(out, &raw); err != nil {
+		return nil, fmt.Errorf("parse gh pr list (review-requested): %w", err)
 	}
 	prs := make([]PullRequest, len(raw))
 	for i, r := range raw {
@@ -172,6 +246,14 @@ func (c *GhCli) UpdatePRBody(_ context.Context, number int, body string) error {
 	_, err := c.run("gh", "pr", "edit", strconv.Itoa(number), "--body", body)
 	if err != nil {
 		return wrapGhErr(err, fmt.Sprintf("gh pr edit %d --body", number))
+	}
+	return nil
+}
+
+func (c *GhCli) UpdatePRTitle(_ context.Context, number int, newTitle string) error {
+	_, err := c.run("gh", "pr", "edit", strconv.Itoa(number), "--title", newTitle)
+	if err != nil {
+		return wrapGhErr(err, fmt.Sprintf("gh pr edit %d --title", number))
 	}
 	return nil
 }
