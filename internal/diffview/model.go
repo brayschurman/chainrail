@@ -67,8 +67,10 @@ var (
 	bgAdd      = lipgloss.Color("#143020") // muted forest green for + lines
 	bgDel      = lipgloss.Color("#3a1a1a") // muted wine red for - lines
 	bgGutter   = lipgloss.Color("#161616") // line-number gutter background
-	bgAddGut   = lipgloss.Color("#0e2418") // gutter on + lines (slightly darker than bgAdd)
-	bgDelGut   = lipgloss.Color("#2e1414") // gutter on - lines (slightly darker than bgDel)
+	bgAddGut    = lipgloss.Color("#0e2418") // gutter on + lines (slightly darker than bgAdd)
+	bgDelGut    = lipgloss.Color("#2e1414") // gutter on - lines (slightly darker than bgDel)
+	bgAddBright = lipgloss.Color("#1f6b3a") // saturated green for the *changed* word spans
+	bgDelBright = lipgloss.Color("#7a2a2a") // saturated red for the *changed* word spans
 )
 
 // Reusable styles. Width is applied at render time so panes can be sized
@@ -89,8 +91,18 @@ var (
 	styleKey      = lipgloss.NewStyle().Background(bgChrome).Foreground(colorPink).Bold(true)
 	styleKeyDim   = lipgloss.NewStyle().Background(bgChrome).Foreground(colorFaint)
 	styleGutter   = lipgloss.NewStyle().Background(bgGutter).Foreground(colorFaint)
-	styleAddGut   = lipgloss.NewStyle().Background(bgAddGut).Foreground(colorFaint)
-	styleDelGut   = lipgloss.NewStyle().Background(bgDelGut).Foreground(colorFaint)
+	styleAddGut       = lipgloss.NewStyle().Background(bgAddGut).Foreground(colorFaint)
+	styleDelGut       = lipgloss.NewStyle().Background(bgDelGut).Foreground(colorFaint)
+	styleAddBrightSpan = lipgloss.NewStyle().Background(bgAddBright).Foreground(colorBright).Bold(true)
+	styleDelBrightSpan = lipgloss.NewStyle().Background(bgDelBright).Foreground(colorBright).Bold(true)
+)
+
+// rowKind tells styledRowSpans which palette to use.
+type rowKind int
+
+const (
+	kindAdd rowKind = iota
+	kindDel
 )
 
 const (
@@ -356,23 +368,43 @@ func fileCountStr(cur, total int) string {
 // renderFileLines walks a file's diff once, tracking old/new line numbers as
 // it goes, and produces one fully-styled string per displayable line. Hunk
 // headers reset the counters; file headers are dropped.
+//
+// When a LineDel is immediately followed by one or more LineAdds, the two
+// sides are run through word-level diff so the changed characters inside each
+// line stand out against the muted line-level tint.
 func (m Model) renderFileLines(f File, w int) []string {
 	out := make([]string, 0, len(f.Lines))
 	var oldNo, newNo int
-	for _, l := range f.Lines {
+	for i := 0; i < len(f.Lines); i++ {
+		l := f.Lines[i]
 		switch l.Kind {
 		case LineFile:
-			// Drop — we already have the file-path header bar above.
 			continue
 		case LineHunk:
 			oldNo, newNo = parseHunkStart(l.Text)
 			out = append(out, styleHunkLine.Width(w).Render(" "+l.Text))
+		case LineDel:
+			// Look ahead — if the very next line is an Add, pair them and
+			// render both with word-level highlighting.
+			if i+1 < len(f.Lines) && f.Lines[i+1].Kind == LineAdd {
+				addLine := f.Lines[i+1]
+				oldBody := stripMarker(l.Text)
+				newBody := stripMarker(addLine.Text)
+				oldSpans, newSpans := pairWordSpans(oldBody, newBody)
+				if oldSpans != nil {
+					out = append(out, m.styledRowSpans(oldSpans, f.Path, oldNo, 0, w, kindDel))
+					out = append(out, m.styledRowSpans(newSpans, f.Path, 0, newNo, w, kindAdd))
+					oldNo++
+					newNo++
+					i++ // consumed the paired Add
+					continue
+				}
+			}
+			out = append(out, m.styledRow(l, f.Path, oldNo, 0, w))
+			oldNo++
 		case LineAdd:
 			out = append(out, m.styledRow(l, f.Path, 0, newNo, w))
 			newNo++
-		case LineDel:
-			out = append(out, m.styledRow(l, f.Path, oldNo, 0, w))
-			oldNo++
 		case LineContext:
 			out = append(out, m.styledRow(l, f.Path, oldNo, newNo, w))
 			oldNo++
@@ -423,6 +455,61 @@ func (m Model) styledRow(l Line, path string, oldNo, newNo, w int) string {
 	}
 	content := lineStyle.Width(contentW).Render(body)
 	return gutter + mark + content
+}
+
+// styledRowSpans renders a paired +/- line using word-level spans. Unchanged
+// spans get the muted line tint; spans flagged as changed get the bright
+// span style. Syntax highlighting is intentionally skipped for spans rows —
+// chroma's ANSI codes would clash with span-level backgrounds, and word-level
+// diff is most useful on lines where the *change* matters more than the
+// language coloring (config files, dep lists, paths).
+func (m Model) styledRowSpans(spans []wordSpan, path string, oldNo, newNo, w int, kind rowKind) string {
+	gutterText := fmt.Sprintf("%s %s ", numCol(oldNo), numCol(newNo))
+
+	var gutterStyle, lineStyle, markerStyle, brightStyle lipgloss.Style
+	var marker string
+	switch kind {
+	case kindAdd:
+		gutterStyle = styleAddGut
+		lineStyle = styleAddLine
+		markerStyle = styleAddMark
+		brightStyle = styleAddBrightSpan
+		marker = "+"
+	case kindDel:
+		gutterStyle = styleDelGut
+		lineStyle = styleDelLine
+		markerStyle = styleDelMark
+		brightStyle = styleDelBrightSpan
+		marker = "-"
+	}
+
+	gutter := gutterStyle.Render(gutterText)
+	mark := markerStyle.Render(marker + " ")
+
+	// Render the spans: equal spans use the line tint (lineStyle as the
+	// surrounding background), changed spans get the brighter span style.
+	var body strings.Builder
+	for _, s := range spans {
+		if s.Kind == wordChanged {
+			body.WriteString(brightStyle.Render(s.Text))
+		} else {
+			body.WriteString(lineStyle.Render(s.Text))
+		}
+	}
+
+	contentW := w - lipgloss.Width(gutter) - lipgloss.Width(mark)
+	if contentW < 1 {
+		contentW = 1
+	}
+	// Pad the right with the muted line color so the row fills the pane width.
+	bodyText := body.String()
+	bodyW := lipgloss.Width(bodyText)
+	padN := contentW - bodyW
+	if padN < 0 {
+		padN = 0
+	}
+	pad := lineStyle.Render(strings.Repeat(" ", padN))
+	return gutter + mark + bodyText + pad
 }
 
 // numCol formats a line number into a 4-char right-aligned column, or four
