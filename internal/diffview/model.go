@@ -24,6 +24,9 @@ type Model struct {
 	// expensive (chroma + lipgloss) work per file/width and reuse it on every
 	// frame. Invalidated when cursor or width changes.
 	rc renderCache
+	// Content-hash LRU cache so identical lines across files (a dep bump in
+	// 12 package.json files, etc.) only get rendered once per width.
+	lc *lineCache
 }
 
 // renderCache stores fully pre-formatted strings — ready to write straight to
@@ -117,6 +120,7 @@ func New(title string, files []File) Model {
 		width:       defaultWidth,
 		height:      defaultHeight,
 		highlighter: NewHighlighter(),
+		lc:          newLineCache(4096),
 	}
 }
 
@@ -385,18 +389,22 @@ func (m Model) renderFileLines(f File, w int) []string {
 			out = append(out, styleHunkLine.Width(w).Render(" "+l.Text))
 		case LineDel:
 			// Look ahead — if the very next line is an Add, pair them and
-			// render both with word-level highlighting.
+			// render both with word-level highlighting. Word-paired rows are
+			// not cached (gutter+span composition makes the cache key fragile);
+			// the per-line cache below still covers unpaired ± lines.
 			if i+1 < len(f.Lines) && f.Lines[i+1].Kind == LineAdd {
 				addLine := f.Lines[i+1]
 				oldBody := stripMarker(l.Text)
 				newBody := stripMarker(addLine.Text)
 				oldSpans, newSpans := pairWordSpans(oldBody, newBody)
 				if oldSpans != nil {
-					out = append(out, m.styledRowSpans(oldSpans, f.Path, oldNo, 0, w, kindDel))
-					out = append(out, m.styledRowSpans(newSpans, f.Path, 0, newNo, w, kindAdd))
+					out = append(out,
+						m.styledRowSpans(oldSpans, f.Path, oldNo, 0, w, kindDel),
+						m.styledRowSpans(newSpans, f.Path, 0, newNo, w, kindAdd),
+					)
 					oldNo++
 					newNo++
-					i++ // consumed the paired Add
+					i++
 					continue
 				}
 			}
@@ -427,6 +435,16 @@ func (m Model) renderFileLines(f File, w int) []string {
 func (m Model) styledRow(l Line, path string, oldNo, newNo, w int) string {
 	body := stripMarker(l.Text)
 	gutterText := fmt.Sprintf("%s %s ", numCol(oldNo), numCol(newNo))
+
+	// Cache check — line numbers are part of the key only via the gutter
+	// text we prepend, so we hash the body separately and re-attach gutter.
+	ext := pathExt(path)
+	bodyKey := lineKey(l.Kind, ext, w, body)
+	if m.lc != nil {
+		if cached, ok := m.lc.Get(bodyKey); ok {
+			return prependGutter(cached, gutterText, l.Kind)
+		}
+	}
 
 	var gutterStyle, lineStyle, markerStyle lipgloss.Style
 	var bg lipgloss.Color
@@ -471,7 +489,41 @@ func (m Model) styledRow(l Line, path string, oldNo, newNo, w int) string {
 		// Render's Width clamp. (Long-line handling is its own ticket.)
 	}
 	pad := lineStyle.Render(strings.Repeat(" ", padN))
-	return gutter + mark + highlighted + pad
+	bodySegment := mark + highlighted + pad
+	if m.lc != nil {
+		m.lc.Put(bodyKey, bodySegment)
+	}
+	return gutter + bodySegment
+}
+
+// prependGutter rebuilds the leading gutter for a cached body segment so we
+// can show different line numbers without re-rendering the body itself.
+func prependGutter(bodySegment, gutterText string, kind LineKind) string {
+	var st lipgloss.Style
+	switch kind {
+	case LineAdd:
+		st = styleAddGut
+	case LineDel:
+		st = styleDelGut
+	default:
+		st = styleGutter
+	}
+	return st.Render(gutterText) + bodySegment
+}
+
+// pathExt returns the lowercased file extension used as part of the cache
+// key. Two files sharing the same extension share a lexer and therefore
+// produce identical renders for identical line content.
+func pathExt(path string) string {
+	for i := len(path) - 1; i >= 0; i-- {
+		if path[i] == '.' {
+			return strings.ToLower(path[i:])
+		}
+		if path[i] == '/' {
+			break
+		}
+	}
+	return ""
 }
 
 // styledRowSpans renders a paired +/- line using word-level spans. Unchanged
