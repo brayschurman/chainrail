@@ -38,6 +38,10 @@ type Model struct {
 	// available. Empty when no repo root is configured (test contexts).
 	DupeSignals map[string]DupeSignal
 
+	// PromptInjectSignals records workflow-file prompt-injection findings.
+	// Populated by runDetectors.
+	PromptInjectSignals map[string]PromptInjectSignal
+
 	// RepoRoot is the local filesystem path of the repo, used by the
 	// duplicate-detector's git grep. Optional; when unset, dupe detection
 	// is skipped.
@@ -182,9 +186,15 @@ func New(title string, files []File) Model {
 // file in the PR. Results live on the Model so the render path is allocation-
 // free per frame.
 func (m *Model) runDetectors() {
+	if m.PromptInjectSignals == nil {
+		m.PromptInjectSignals = map[string]PromptInjectSignal{}
+	}
 	for _, f := range m.Files {
 		if sig := DetectCIRisk(f.Path, f.Lines); sig.Risk > CIRiskNone {
 			m.CISignals[f.Path] = sig
+		}
+		if sig := DetectPromptInjection(f.Path, f.Lines); sig.Severity > PromptInjectNone {
+			m.PromptInjectSignals[f.Path] = sig
 		}
 	}
 }
@@ -212,19 +222,41 @@ func (m *Model) RunRepoDetectors() {
 	}
 }
 
-// buildDisplayOrder produces the file ordering shown in the sidebar. CI risk
-// files come first (CIRiskWeakening before CIRiskConfig), then everything
-// else in original diff order. Stable within each bucket.
+// buildDisplayOrder produces the file ordering shown in the sidebar.
+// Severity bucket: prompt injection (high+) > CI weakening > CI config >
+// prompt injection (suspect) > dupes > everything else. Stable within buckets.
 func (m *Model) buildDisplayOrder() {
 	order := make([]int, len(m.Files))
 	for i := range m.Files {
 		order[i] = i
 	}
+	score := func(path string) int {
+		if s, ok := m.PromptInjectSignals[path]; ok {
+			switch s.Severity {
+			case PromptInjectCritical:
+				return 50
+			case PromptInjectHigh:
+				return 40
+			case PromptInjectSuspect:
+				return 20
+			}
+		}
+		switch m.CISignals[path].Risk {
+		case CIRiskWeakening:
+			return 30
+		case CIRiskConfig:
+			return 25
+		}
+		if len(m.DupeSignals[path].Findings) > 0 {
+			return 10
+		}
+		return 0
+	}
 	sort.SliceStable(order, func(i, j int) bool {
 		ai, bi := m.Files[order[i]], m.Files[order[j]]
-		ar, br := m.CISignals[ai.Path].Risk, m.CISignals[bi.Path].Risk
-		if ar != br {
-			return ar > br
+		si, sj := score(ai.Path), score(bi.Path)
+		if si != sj {
+			return si > sj
 		}
 		return order[i] < order[j]
 	})
@@ -239,15 +271,14 @@ func (m Model) fileAt(vis int) File {
 	return m.Files[vis]
 }
 
-// hasUnwaivedCIBlockers reports whether any CI-touching file is unreviewed
-// AND unwaived. Used to gate 100% progress.
+// hasUnwaivedCIBlockers reports whether any CI-touching or prompt-injection
+// file is unreviewed AND unwaived. Used to gate 100% progress.
 func (m Model) hasUnwaivedCIBlockers() bool {
 	if m.ReviewState == nil {
 		return false
 	}
 	for _, f := range m.Files {
-		sig := m.CISignals[f.Path]
-		if sig.Risk == CIRiskNone {
+		if !m.isBlockerFile(f.Path) {
 			continue
 		}
 		if mark, ok := m.ReviewState.Files[f.Path]; ok {
@@ -258,6 +289,18 @@ func (m Model) hasUnwaivedCIBlockers() bool {
 				continue
 			}
 		}
+		return true
+	}
+	return false
+}
+
+// isBlockerFile reports whether a file carries a detection severe enough to
+// block 100% progress without a waiver.
+func (m Model) isBlockerFile(path string) bool {
+	if m.CISignals[path].Risk > CIRiskNone {
+		return true
+	}
+	if sig, ok := m.PromptInjectSignals[path]; ok && sig.Severity >= PromptInjectHigh {
 		return true
 	}
 	return false
@@ -487,18 +530,7 @@ func (m Model) buildSidebarRows(w int) []string {
 		name := truncatePath(f.Path, nameW)
 		counts := fmt.Sprintf("+%-3d -%-3d", f.Adds, f.Dels)
 		box := m.checkboxFor(f.Path)
-		risk := m.CISignals[f.Path].Risk
-		ciMark := "  "
-		switch risk {
-		case CIRiskWeakening:
-			ciMark = styleCIBlock.Render("🚨")
-		case CIRiskConfig:
-			ciMark = styleCIWarn.Render("⚠ ")
-		default:
-			if len(m.DupeSignals[f.Path].Findings) > 0 {
-				ciMark = styleCIWarn.Render("↻ ")
-			}
-		}
+		ciMark := m.markerFor(f.Path)
 		row := fmt.Sprintf(" %s %s %s %-*s %s",
 			selectionMarker(i == m.cursor),
 			box,
@@ -518,6 +550,30 @@ func (m Model) buildSidebarRows(w int) []string {
 		}
 	}
 	return rows
+}
+
+// markerFor returns the small severity icon for the file's sidebar row.
+// Priority (highest first): prompt injection > CI weakening > CI config >
+// dupe finding > none.
+func (m Model) markerFor(path string) string {
+	if sig, ok := m.PromptInjectSignals[path]; ok {
+		switch sig.Severity {
+		case PromptInjectCritical, PromptInjectHigh:
+			return styleCIBlock.Render("☣ ")
+		case PromptInjectSuspect:
+			return styleCIWarn.Render("☣ ")
+		}
+	}
+	switch m.CISignals[path].Risk {
+	case CIRiskWeakening:
+		return styleCIBlock.Render("🚨")
+	case CIRiskConfig:
+		return styleCIWarn.Render("⚠ ")
+	}
+	if len(m.DupeSignals[path].Findings) > 0 {
+		return styleCIWarn.Render("↻ ")
+	}
+	return "  "
 }
 
 // checkboxFor returns the 3-char box marker for a file. "[✓]" reviewed,
@@ -590,7 +646,7 @@ func (m Model) startWaiver() (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	f := m.fileAt(m.cursor)
-	if m.CISignals[f.Path].Risk == CIRiskNone {
+	if !m.isBlockerFile(f.Path) {
 		return m, nil
 	}
 	ti := textinput.New()
