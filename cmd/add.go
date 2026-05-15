@@ -141,32 +141,34 @@ type parsedStackBranch struct {
 
 // parseStackBranch decodes a branch name of the form `<user>/<base-slug>-<N>-<task-slug>`.
 // Returns ok=false if the branch doesn't match this user's stack-branch pattern.
+//
+// Scans right-to-left through dash-separated segments so that hyphens inside
+// base-slug or task-slug are handled correctly (e.g. ignore-logs-1-ignore-logs).
 func parseStackBranch(branch, user string) (parsedStackBranch, bool) {
 	prefix := user + "/"
 	if !strings.HasPrefix(branch, prefix) {
 		return parsedStackBranch{}, false
 	}
-	rest := strings.TrimPrefix(branch, prefix)
-	lastDash := strings.LastIndex(rest, "-")
-	if lastDash < 0 {
+	parts := strings.Split(strings.TrimPrefix(branch, prefix), "-")
+	// Need at least base + N + task = 3 segments.
+	if len(parts) < 3 {
 		return parsedStackBranch{}, false
 	}
-	taskSlug := rest[lastDash+1:]
-	withoutTask := rest[:lastDash]
-	posDash := strings.LastIndex(withoutTask, "-")
-	if posDash < 0 {
-		return parsedStackBranch{}, false
+	// Walk right-to-left; skip the rightmost segment (it belongs to task-slug),
+	// then find the first integer — that's the position number.
+	for i := len(parts) - 2; i >= 1; i-- {
+		pos, err := strconv.Atoi(parts[i])
+		if err != nil || pos < 1 {
+			continue
+		}
+		baseSlug := strings.Join(parts[:i], "-")
+		taskSlug := strings.Join(parts[i+1:], "-")
+		if baseSlug == "" || taskSlug == "" {
+			continue
+		}
+		return parsedStackBranch{baseSlug: baseSlug, position: pos, taskSlug: taskSlug}, true
 	}
-	positionStr := withoutTask[posDash+1:]
-	position, err := strconv.Atoi(positionStr)
-	if err != nil || position < 1 {
-		return parsedStackBranch{}, false
-	}
-	baseSlug := withoutTask[:posDash]
-	if baseSlug == "" || taskSlug == "" {
-		return parsedStackBranch{}, false
-	}
-	return parsedStackBranch{baseSlug: baseSlug, position: position, taskSlug: taskSlug}, true
+	return parsedStackBranch{}, false
 }
 
 func defaultGetUser() (string, error) {
