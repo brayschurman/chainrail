@@ -1,0 +1,126 @@
+package github
+
+import (
+	"context"
+	"fmt"
+)
+
+type MockGhClient struct {
+	User    string
+	PRs     map[int]PullRequest
+	NextNum int
+	Calls   []string
+}
+
+func NewMock() *MockGhClient {
+	return &MockGhClient{
+		User:    "test-user",
+		PRs:     map[int]PullRequest{},
+		NextNum: 100,
+	}
+}
+
+func (m *MockGhClient) record(call string) {
+	m.Calls = append(m.Calls, call)
+}
+
+func (m *MockGhClient) SetState(number int, state string) {
+	pr, ok := m.PRs[number]
+	if !ok {
+		return
+	}
+	pr.State = state
+	m.PRs[number] = pr
+}
+
+func (m *MockGhClient) CurrentUser(_ context.Context) (string, error) {
+	m.record("CurrentUser")
+	return m.User, nil
+}
+
+func (m *MockGhClient) ListOpenPRs(_ context.Context) ([]PullRequest, error) {
+	m.record("ListOpenPRs")
+	out := make([]PullRequest, 0, len(m.PRs))
+	for _, pr := range m.PRs {
+		if pr.State == "OPEN" {
+			out = append(out, pr)
+		}
+	}
+	return out, nil
+}
+
+func (m *MockGhClient) ListMergedPRsByHead(_ context.Context, heads []string) ([]PullRequest, error) {
+	m.record(fmt.Sprintf("ListMergedPRsByHead(%v)", heads))
+	headSet := make(map[string]bool, len(heads))
+	for _, h := range heads {
+		headSet[h] = true
+	}
+	type entry struct {
+		num int
+		pr  PullRequest
+	}
+	byHead := map[string]entry{}
+	for num, pr := range m.PRs {
+		if pr.State != "MERGED" {
+			continue
+		}
+		if !headSet[pr.HeadRefName] {
+			continue
+		}
+		if existing, ok := byHead[pr.HeadRefName]; !ok || num > existing.num {
+			byHead[pr.HeadRefName] = entry{num: num, pr: pr}
+		}
+	}
+	out := make([]PullRequest, 0, len(byHead))
+	for _, e := range byHead {
+		out = append(out, e.pr)
+	}
+	return out, nil
+}
+
+func (m *MockGhClient) GetPR(_ context.Context, number int) (PullRequest, error) {
+	m.record(fmt.Sprintf("GetPR(%d)", number))
+	pr, ok := m.PRs[number]
+	if !ok {
+		return PullRequest{}, fmt.Errorf("mock: PR #%d not found", number)
+	}
+	return pr, nil
+}
+
+func (m *MockGhClient) CreatePR(_ context.Context, p NewPR) (PullRequest, error) {
+	m.record(fmt.Sprintf("CreatePR(head=%s,base=%s)", p.Head, p.Base))
+	num := m.NextNum
+	m.NextNum++
+	pr := PullRequest{
+		Number:      num,
+		Title:       p.Title,
+		Body:        p.Body,
+		HeadRefName: p.Head,
+		BaseRefName: p.Base,
+		State:       "OPEN",
+	}
+	m.PRs[num] = pr
+	return pr, nil
+}
+
+func (m *MockGhClient) UpdatePRBody(_ context.Context, number int, body string) error {
+	m.record(fmt.Sprintf("UpdatePRBody(%d)", number))
+	pr, ok := m.PRs[number]
+	if !ok {
+		return fmt.Errorf("mock: PR #%d not found", number)
+	}
+	pr.Body = body
+	m.PRs[number] = pr
+	return nil
+}
+
+func (m *MockGhClient) UpdatePRBase(_ context.Context, number int, newBase string) error {
+	m.record(fmt.Sprintf("UpdatePRBase(%d,%s)", number, newBase))
+	pr, ok := m.PRs[number]
+	if !ok {
+		return fmt.Errorf("mock: PR #%d not found", number)
+	}
+	pr.BaseRefName = newBase
+	m.PRs[number] = pr
+	return nil
+}
