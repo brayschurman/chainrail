@@ -5,9 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"strconv"
-	"strings"
 
 	"github.com/brayschurman/chainrail/internal/diffview"
 	"github.com/brayschurman/chainrail/internal/github"
@@ -43,15 +41,6 @@ func init() {
 	rootCmd.AddCommand(viewCmd)
 }
 
-// gitTopLevel returns the working-tree root for the current directory, or
-// "" if we're not inside a git repo.
-func gitTopLevel() string {
-	out, err := exec.Command("git", "rev-parse", "--show-toplevel").Output()
-	if err != nil {
-		return ""
-	}
-	return strings.TrimSpace(string(out))
-}
 
 func runView(out io.Writer, r output.Renderer, number int, deps viewDeps) error {
 	ctx := context.Background()
@@ -94,12 +83,6 @@ func runView(out io.Writer, r output.Renderer, number int, deps viewDeps) error 
 				m.BlobByPath = blobs
 			}
 		}
-	}
-
-	// Discover repo root for filesystem-level detectors (dupe detection).
-	if root := gitTopLevel(); root != "" {
-		m.RepoRoot = root
-		m.RunRepoDetectors()
 	}
 
 	p := tea.NewProgram(m, tea.WithAltScreen())

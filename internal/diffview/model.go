@@ -3,7 +3,6 @@ package diffview
 import (
 	"context"
 	"fmt"
-	"sort"
 	"strings"
 	"time"
 
@@ -30,17 +29,12 @@ type Model struct {
 	BlobByPath map[string]string
 
 	// CISignals records the per-file CI risk classification computed once
-	// at load time. Populated by ensureDetectors.
+	// at load time. The signal still drives the 100%-progress hard-block
+	// (a typed waiver via shift+W is required when CI files are unreviewed),
+	// but is no longer surfaced as a sidebar marker — that was too noisy
+	// without an AI-based discriminator. Kept available for a future
+	// `cn lint-pr` CI-mode subcommand.
 	CISignals map[string]CISignal
-
-	// DupeSignals records possible-duplicate symbol findings per file.
-	// Computed once after the Files slice is set when a repo root is
-	// available. Empty when no repo root is configured (test contexts).
-	DupeSignals map[string]DupeSignal
-
-	// PromptInjectSignals records workflow-file prompt-injection findings.
-	// Populated by runDetectors.
-	PromptInjectSignals map[string]PromptInjectSignal
 
 	// PRBody is the PR description text — used by the plan detector.
 	PRBody string
@@ -51,11 +45,6 @@ type Model struct {
 	// PlanNudger sends the nudge comment when the reviewer presses P.
 	// Optional; nil disables the nudge.
 	PlanNudger func(number int, body string) error
-
-	// RepoRoot is the local filesystem path of the repo, used by the
-	// duplicate-detector's git grep. Optional; when unset, dupe detection
-	// is skipped.
-	RepoRoot string
 
 	// displayOrder is the index permutation that re-orders Files so CI-
 	// touching files come first. Computed once, used by all sidebar render
@@ -196,81 +185,24 @@ func New(title string, files []File) Model {
 // file in the PR. Results live on the Model so the render path is allocation-
 // free per frame.
 func (m *Model) runDetectors() {
-	if m.PromptInjectSignals == nil {
-		m.PromptInjectSignals = map[string]PromptInjectSignal{}
-	}
 	m.PlanSignal = DetectPlan(m.PRBody)
 	for _, f := range m.Files {
 		if sig := DetectCIRisk(f.Path, f.Lines); sig.Risk > CIRiskNone {
 			m.CISignals[f.Path] = sig
 		}
-		if sig := DetectPromptInjection(f.Path, f.Lines); sig.Severity > PromptInjectNone {
-			m.PromptInjectSignals[f.Path] = sig
-		}
 	}
 }
 
-// runRepoDetectors runs detectors that need filesystem access (i.e. git grep
-// for dupe detection). Called by the caller (cmd/view.go) after it discovers
-// the repo root, since the diffview package doesn't shell out by itself in
-// the New constructor.
-func (m *Model) RunRepoDetectors() {
-	if m.RepoRoot == "" {
-		return
-	}
-	if m.DupeSignals == nil {
-		m.DupeSignals = map[string]DupeSignal{}
-	}
-	excluded := make(map[string]bool, len(m.Files))
-	for _, f := range m.Files {
-		excluded[f.Path] = true
-	}
-	for _, f := range m.Files {
-		sig := DetectDupes(f.Path, f.Lines, m.RepoRoot, excluded)
-		if len(sig.Findings) > 0 {
-			m.DupeSignals[f.Path] = sig
-		}
-	}
-}
 
-// buildDisplayOrder produces the file ordering shown in the sidebar.
-// Severity bucket: prompt injection (high+) > CI weakening > CI config >
-// prompt injection (suspect) > dupes > everything else. Stable within buckets.
+// buildDisplayOrder is currently a passthrough — files render in the order
+// the diff parser produced them. Earlier versions reordered by severity
+// markers but that turned out to be more noise than signal. The function is
+// kept so future re-orderings (e.g. tree view) have a single seam.
 func (m *Model) buildDisplayOrder() {
 	order := make([]int, len(m.Files))
 	for i := range m.Files {
 		order[i] = i
 	}
-	score := func(path string) int {
-		if s, ok := m.PromptInjectSignals[path]; ok {
-			switch s.Severity {
-			case PromptInjectCritical:
-				return 50
-			case PromptInjectHigh:
-				return 40
-			case PromptInjectSuspect:
-				return 20
-			}
-		}
-		switch m.CISignals[path].Risk {
-		case CIRiskWeakening:
-			return 30
-		case CIRiskConfig:
-			return 25
-		}
-		if len(m.DupeSignals[path].Findings) > 0 {
-			return 10
-		}
-		return 0
-	}
-	sort.SliceStable(order, func(i, j int) bool {
-		ai, bi := m.Files[order[i]], m.Files[order[j]]
-		si, sj := score(ai.Path), score(bi.Path)
-		if si != sj {
-			return si > sj
-		}
-		return order[i] < order[j]
-	})
 	m.displayOrder = order
 }
 
@@ -306,15 +238,10 @@ func (m Model) hasUnwaivedCIBlockers() bool {
 }
 
 // isBlockerFile reports whether a file carries a detection severe enough to
-// block 100% progress without a waiver.
+// block 100% progress without a typed waiver. Currently only CI-touching
+// files; the criterion is intentionally narrow so the gate stays meaningful.
 func (m Model) isBlockerFile(path string) bool {
-	if m.CISignals[path].Risk > CIRiskNone {
-		return true
-	}
-	if sig, ok := m.PromptInjectSignals[path]; ok && sig.Severity >= PromptInjectHigh {
-		return true
-	}
-	return false
+	return m.CISignals[path].Risk > CIRiskNone
 }
 
 func (m Model) Init() tea.Cmd { return nil }
@@ -426,7 +353,6 @@ func (m Model) View() string {
 	mp.ensureCache()
 
 	header := mp.renderTopBar()
-	preReview := mp.renderPreReviewPanel(m.width)
 	sidebar := mp.renderSidebarCached()
 	diff := mp.renderDiffCached()
 	body := lipgloss.JoinHorizontal(lipgloss.Top, sidebar, diff)
@@ -438,12 +364,7 @@ func (m Model) View() string {
 		foot = mp.renderKeybindings(m.width)
 	}
 
-	out := header + "\n"
-	if preReview != "" {
-		out += preReview + "\n"
-	}
-	out += body + "\n" + foot
-	return out
+	return header + "\n" + body + "\n" + foot
 }
 
 // ---------------------------------------------------------------------------
@@ -493,131 +414,6 @@ func (m Model) renderTopBar() string {
 }
 
 // renderPreReviewPanel produces the chip-style aggregator that sits between
-// the top bar and the body. Returns "" when there's nothing useful to say
-// (no detector signals fired and no agent-PR markers worth mentioning).
-//
-// When terminal height is tight (<=20 rows), we collapse to a single-line
-// chip row: "PRE-REVIEW · 🚨1 · ⚠3 · ↻2"; otherwise we render one line per
-// signal category for legibility.
-func (m Model) renderPreReviewPanel(w int) string {
-	ciW, ciC := m.ciCounts()
-	piH, piS := m.piCounts()
-	dupes := m.dupeCount()
-	totalFiles := len(m.Files)
-	if ciW == 0 && ciC == 0 && piH == 0 && piS == 0 && dupes == 0 &&
-		m.PlanSignal.Severity == PlanPresent {
-		// Everything's clean — no reason to add a panel row.
-		return ""
-	}
-
-	if m.height > 0 && m.height <= 20 {
-		// Compact single-line chip strip.
-		var chips []string
-		if ciW > 0 {
-			chips = append(chips, styleCIBlock.Render(fmt.Sprintf("🚨%d", ciW)))
-		}
-		if ciC > 0 {
-			chips = append(chips, styleCIWarn.Render(fmt.Sprintf("⚠%d", ciC)))
-		}
-		if piH > 0 {
-			chips = append(chips, styleCIBlock.Render(fmt.Sprintf("☣%d", piH)))
-		}
-		if dupes > 0 {
-			chips = append(chips, styleCIWarn.Render(fmt.Sprintf("↻%d", dupes)))
-		}
-		if m.PlanSignal.Severity == PlanMissing {
-			chips = append(chips, styleCIBlock.Render("no plan"))
-		} else if m.PlanSignal.Severity == PlanThin {
-			chips = append(chips, styleCIWarn.Render("thin plan"))
-		}
-		line := " " + styleHeading.Render("PRE-REVIEW") + "  " + strings.Join(chips, " · ")
-		return styleChrome.Width(w).Render(line)
-	}
-
-	// Multi-line expanded panel.
-	var lines []string
-	lines = append(lines, styleChrome.Width(w).Render(" "+styleHeading.Render("PRE-REVIEW")))
-
-	if ciW > 0 || ciC > 0 {
-		marker := styleCIBlock.Render(" 🚨")
-		text := fmt.Sprintf(" %d weakening, %d config touched", ciW, ciC)
-		if ciW == 0 {
-			marker = styleCIWarn.Render(" ⚠ ")
-			text = fmt.Sprintf(" %d CI / test / coverage config touched", ciC)
-		}
-		lines = append(lines, styleChrome.Width(w).Render(marker+text))
-	}
-	if piH > 0 || piS > 0 {
-		marker := styleCIBlock.Render(" ☣ ")
-		text := fmt.Sprintf(" %d high/critical, %d suspect — prompt-injection risk", piH, piS)
-		if piH == 0 {
-			marker = styleCIWarn.Render(" ☣ ")
-			text = fmt.Sprintf(" %d suspect prompt-injection signals", piS)
-		}
-		lines = append(lines, styleChrome.Width(w).Render(marker+text))
-	}
-	if dupes > 0 {
-		lines = append(lines, styleChrome.Width(w).Render(
-			styleCIWarn.Render(" ↻ ")+
-				fmt.Sprintf(" %d files have new symbols with possible duplicates", dupes)))
-	}
-	switch m.PlanSignal.Severity {
-	case PlanMissing:
-		hint := ""
-		if m.ReviewState != nil && m.ReviewState.NudgedForPlanAt.IsZero() && m.PlanNudger != nil {
-			hint = styleKeyDim.Render("  press P to nudge")
-		}
-		lines = append(lines, styleChrome.Width(w).Render(
-			styleCIBlock.Render(" 🚨")+" no implementation plan in PR body"+hint))
-	case PlanThin:
-		lines = append(lines, styleChrome.Width(w).Render(
-			styleCIWarn.Render(" ⚠ ")+fmt.Sprintf(" thin plan in PR body (%d chars, no structure)", m.PlanSignal.Chars)))
-	}
-	lines = append(lines, styleChrome.Width(w).Render(
-		styleKeyDim.Render(fmt.Sprintf(" · %d files", totalFiles))))
-
-	return strings.Join(lines, "\n")
-}
-
-// ciCounts returns the number of weakening / config-only CI signals.
-func (m Model) ciCounts() (weakening, config int) {
-	for _, s := range m.CISignals {
-		switch s.Risk {
-		case CIRiskWeakening:
-			weakening++
-		case CIRiskConfig:
-			config++
-		}
-	}
-	return weakening, config
-}
-
-// piCounts returns the number of high/critical and suspect prompt-injection
-// signals across all files.
-func (m Model) piCounts() (high, suspect int) {
-	for _, s := range m.PromptInjectSignals {
-		switch s.Severity {
-		case PromptInjectCritical, PromptInjectHigh:
-			high++
-		case PromptInjectSuspect:
-			suspect++
-		}
-	}
-	return high, suspect
-}
-
-// dupeCount returns the number of files that have at least one duplicate-
-// symbol finding.
-func (m Model) dupeCount() int {
-	n := 0
-	for _, s := range m.DupeSignals {
-		if len(s.Findings) > 0 {
-			n++
-		}
-	}
-	return n
-}
-
 // planBadge renders a one-chip indicator for plan presence. Empty when PR
 // body is unknown (PlanSignal zero-value with Chars=0 happens both for "no
 // body" and "we never set PRBody"; the unset case is treated as silence).
@@ -691,9 +487,9 @@ func (m Model) buildSidebarRows(w int) []string {
 	rows := make([]string, 0, len(m.Files))
 
 	// Reserve: " " (1) + selection marker (1) + " " (1) + checkbox "[✓]" (3)
-	// + " " (1) + CI mark "  " (2) + " " (1) + name + " " + "+ddd -ddd" (10).
+	// + " " (1) + name + " " + "+ddd -ddd" (10).
 	const countsW = 11
-	const fixedW = 1 + 1 + 1 + 3 + 1 + 2 + 1 + 1 + countsW
+	const fixedW = 1 + 1 + 1 + 3 + 1 + 1 + countsW
 	nameW := w - fixedW
 	if nameW < 6 {
 		nameW = 6
@@ -704,11 +500,9 @@ func (m Model) buildSidebarRows(w int) []string {
 		name := truncatePath(f.Path, nameW)
 		counts := fmt.Sprintf("+%-3d -%-3d", f.Adds, f.Dels)
 		box := m.checkboxFor(f.Path)
-		ciMark := m.markerFor(f.Path)
-		row := fmt.Sprintf(" %s %s %s %-*s %s",
+		row := fmt.Sprintf(" %s %s %-*s %s",
 			selectionMarker(i == m.cursor),
 			box,
-			ciMark,
 			nameW, name,
 			counts,
 		)
@@ -726,29 +520,6 @@ func (m Model) buildSidebarRows(w int) []string {
 	return rows
 }
 
-// markerFor returns the small severity icon for the file's sidebar row.
-// Priority (highest first): prompt injection > CI weakening > CI config >
-// dupe finding > none.
-func (m Model) markerFor(path string) string {
-	if sig, ok := m.PromptInjectSignals[path]; ok {
-		switch sig.Severity {
-		case PromptInjectCritical, PromptInjectHigh:
-			return styleCIBlock.Render("☣ ")
-		case PromptInjectSuspect:
-			return styleCIWarn.Render("☣ ")
-		}
-	}
-	switch m.CISignals[path].Risk {
-	case CIRiskWeakening:
-		return styleCIBlock.Render("🚨")
-	case CIRiskConfig:
-		return styleCIWarn.Render("⚠ ")
-	}
-	if len(m.DupeSignals[path].Findings) > 0 {
-		return styleCIWarn.Render("↻ ")
-	}
-	return "  "
-}
 
 // checkboxFor returns the 3-char box marker for a file. "[✓]" reviewed,
 // "[ ]" not. "[~]" reviewed-but-changed-since (stale).
@@ -1310,43 +1081,13 @@ func (m Model) sidebarWidth() int {
 }
 
 // bodyHeight is the height of the sidebar and diff panes (i.e. between the
-// top header bar, the pre-review panel, and the keybinding bar).
+// top header bar and the keybinding bar).
 func (m Model) bodyHeight() int {
-	h := m.height - 2 - m.preReviewHeight()
+	h := m.height - 2
 	if h < 5 {
 		h = 5
 	}
 	return h
-}
-
-// preReviewHeight is the number of lines the pre-review panel will consume.
-// Mirrors the line count produced by renderPreReviewPanel.
-func (m Model) preReviewHeight() int {
-	ciW, ciC := m.ciCounts()
-	piH, piS := m.piCounts()
-	dupes := m.dupeCount()
-	if ciW == 0 && ciC == 0 && piH == 0 && piS == 0 && dupes == 0 &&
-		m.PlanSignal.Severity == PlanPresent {
-		return 0
-	}
-	if m.height > 0 && m.height <= 20 {
-		return 1 // compact chip mode
-	}
-	n := 1 // header line
-	if ciW > 0 || ciC > 0 {
-		n++
-	}
-	if piH > 0 || piS > 0 {
-		n++
-	}
-	if dupes > 0 {
-		n++
-	}
-	if m.PlanSignal.Severity != PlanPresent {
-		n++
-	}
-	n++ // file count footer
-	return n
 }
 
 // diffContentHeight is the number of lines available for actual diff content
