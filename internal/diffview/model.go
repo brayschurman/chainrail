@@ -1,14 +1,21 @@
 package diffview
 
 import (
+	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
 	"github.com/brayschurman/chainrail/internal/reviewstate"
+	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
+
+// (context is used by future detectors; the import keeps room for them
+// without churning later commits.)
+var _ = context.Background
 
 // Model is the bubbletea model for the PR diff viewer.
 type Model struct {
@@ -21,6 +28,20 @@ type Model struct {
 	// BlobByPath maps file path -> blob SHA for the PR's current head, used
 	// to detect "changed since you checked" against persisted review state.
 	BlobByPath map[string]string
+
+	// CISignals records the per-file CI risk classification computed once
+	// at load time. Populated by ensureDetectors.
+	CISignals map[string]CISignal
+
+	// displayOrder is the index permutation that re-orders Files so CI-
+	// touching files come first. Computed once, used by all sidebar render
+	// paths. Empty until ensureDisplayOrder runs.
+	displayOrder []int
+
+	// waiverInput is shown when the user presses shift+W on a CI-risk file
+	// that the 100% gate is blocking on. Pattern mirrors the rename input.
+	waiverInput   textinput.Model
+	enteringWaiver bool
 
 	// ReviewState is the loaded per-file checklist for this PR. Optional;
 	// when nil, review-tracking UI is hidden entirely. The owner+repo+number
@@ -108,6 +129,8 @@ var (
 	styleSidebarDone = lipgloss.NewStyle().Background(bgPane).Foreground(lipgloss.Color("241")).Faint(true)
 	styleProgressOn  = lipgloss.NewStyle().Background(bgChrome).Foreground(lipgloss.Color("82")) // bright green
 	styleProgressOff = lipgloss.NewStyle().Background(bgChrome).Foreground(lipgloss.Color("238"))
+	styleCIBlock     = lipgloss.NewStyle().Foreground(lipgloss.Color("196")).Bold(true)
+	styleCIWarn      = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
 	styleKey      = lipgloss.NewStyle().Background(bgChrome).Foreground(colorPink).Bold(true)
 	styleKeyDim   = lipgloss.NewStyle().Background(bgChrome).Foreground(colorFaint)
 	styleGutter   = lipgloss.NewStyle().Background(bgGutter).Foreground(colorFaint)
@@ -131,19 +154,90 @@ const (
 )
 
 func New(title string, files []File) Model {
-	return Model{
+	m := Model{
 		Title:       title,
 		Files:       files,
 		width:       defaultWidth,
 		height:      defaultHeight,
 		highlighter: NewHighlighter(),
 		lc:          newLineCache(4096),
+		CISignals:   make(map[string]CISignal, len(files)),
 	}
+	m.runDetectors()
+	m.buildDisplayOrder()
+	return m
+}
+
+// runDetectors invokes every available file-level detector once for each
+// file in the PR. Results live on the Model so the render path is allocation-
+// free per frame.
+func (m *Model) runDetectors() {
+	for _, f := range m.Files {
+		if sig := DetectCIRisk(f.Path, f.Lines); sig.Risk > CIRiskNone {
+			m.CISignals[f.Path] = sig
+		}
+	}
+}
+
+// buildDisplayOrder produces the file ordering shown in the sidebar. CI risk
+// files come first (CIRiskWeakening before CIRiskConfig), then everything
+// else in original diff order. Stable within each bucket.
+func (m *Model) buildDisplayOrder() {
+	order := make([]int, len(m.Files))
+	for i := range m.Files {
+		order[i] = i
+	}
+	sort.SliceStable(order, func(i, j int) bool {
+		ai, bi := m.Files[order[i]], m.Files[order[j]]
+		ar, br := m.CISignals[ai.Path].Risk, m.CISignals[bi.Path].Risk
+		if ar != br {
+			return ar > br
+		}
+		return order[i] < order[j]
+	})
+	m.displayOrder = order
+}
+
+// fileAt returns the File at the visual sidebar position vis.
+func (m Model) fileAt(vis int) File {
+	if len(m.displayOrder) > 0 {
+		return m.Files[m.displayOrder[vis]]
+	}
+	return m.Files[vis]
+}
+
+// hasUnwaivedCIBlockers reports whether any CI-touching file is unreviewed
+// AND unwaived. Used to gate 100% progress.
+func (m Model) hasUnwaivedCIBlockers() bool {
+	if m.ReviewState == nil {
+		return false
+	}
+	for _, f := range m.Files {
+		sig := m.CISignals[f.Path]
+		if sig.Risk == CIRiskNone {
+			continue
+		}
+		if mark, ok := m.ReviewState.Files[f.Path]; ok {
+			if mark.Waiver != "" {
+				continue
+			}
+			if !m.ReviewState.ChangedSince(f.Path, m.BlobByPath[f.Path]) {
+				continue
+			}
+		}
+		return true
+	}
+	return false
 }
 
 func (m Model) Init() tea.Cmd { return nil }
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	if m.enteringWaiver {
+		if key, ok := msg.(tea.KeyMsg); ok {
+			return m.updateWaiver(key)
+		}
+	}
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
@@ -185,6 +279,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.toggleReviewed()
 		case "N":
 			m.jumpToNextUnreviewed()
+		case "W":
+			return m.startWaiver()
 		}
 	}
 	if m.scrollY > m.maxScroll() {
@@ -216,7 +312,7 @@ func (m *Model) ensureCache() {
 
 	// Pre-render the diff content lines for the current file.
 	if m.cursor < len(m.Files) {
-		f := m.Files[m.cursor]
+		f := m.fileAt(m.cursor)
 		want.pathHdr = renderFileHeader(f, want.diffW)
 		want.lines = m.renderFileLines(f, want.diffW)
 	}
@@ -244,9 +340,15 @@ func (m Model) View() string {
 	sidebar := mp.renderSidebarCached()
 	diff := mp.renderDiffCached()
 	body := lipgloss.JoinHorizontal(lipgloss.Top, sidebar, diff)
-	keys := mp.renderKeybindings(m.width)
 
-	return header + "\n" + body + "\n" + keys
+	var foot string
+	if mp.enteringWaiver {
+		foot = styleChrome.Width(m.width).Render(" waiver: " + mp.waiverInput.View())
+	} else {
+		foot = mp.renderKeybindings(m.width)
+	}
+
+	return header + "\n" + body + "\n" + foot
 }
 
 // ---------------------------------------------------------------------------
@@ -267,6 +369,12 @@ func (m Model) renderTopBar() string {
 	pct := 0
 	if total > 0 {
 		pct = (done * 100) / total
+	}
+	// Hard-block: even if every file is marked, refuse to surface 100% while
+	// CI-risk files are unwaived. The reviewer has to make an explicit
+	// waiver decision via shift+W.
+	if pct >= 100 && m.hasUnwaivedCIBlockers() {
+		pct = 99
 	}
 	bar := progressBar(done, total, 12)
 	elapsed := m.reviewElapsed()
@@ -333,21 +441,31 @@ func (m Model) buildSidebarRows(w int) []string {
 	rows := make([]string, 0, len(m.Files))
 
 	// Reserve: " " (1) + selection marker (1) + " " (1) + checkbox "[✓]" (3)
-	// + " " (1) + name + " " + "+ddd -ddd" (10).
+	// + " " (1) + CI mark "  " (2) + " " (1) + name + " " + "+ddd -ddd" (10).
 	const countsW = 11
-	const fixedW = 1 + 1 + 1 + 3 + 1 + 1 + countsW
+	const fixedW = 1 + 1 + 1 + 3 + 1 + 2 + 1 + 1 + countsW
 	nameW := w - fixedW
 	if nameW < 6 {
 		nameW = 6
 	}
 
-	for i, f := range m.Files {
+	for i := 0; i < len(m.Files); i++ {
+		f := m.fileAt(i)
 		name := truncatePath(f.Path, nameW)
 		counts := fmt.Sprintf("+%-3d -%-3d", f.Adds, f.Dels)
 		box := m.checkboxFor(f.Path)
-		row := fmt.Sprintf(" %s %s %-*s %s",
+		risk := m.CISignals[f.Path].Risk
+		ciMark := "  "
+		switch risk {
+		case CIRiskWeakening:
+			ciMark = styleCIBlock.Render("🚨")
+		case CIRiskConfig:
+			ciMark = styleCIWarn.Render("⚠ ")
+		}
+		row := fmt.Sprintf(" %s %s %s %-*s %s",
 			selectionMarker(i == m.cursor),
 			box,
+			ciMark,
 			nameW, name,
 			counts,
 		)
@@ -418,14 +536,61 @@ func (m *Model) toggleReviewed() {
 	if m.ReviewState == nil || m.cursor >= len(m.Files) {
 		return
 	}
-	path := m.Files[m.cursor].Path
-	blob := m.BlobByPath[path]
-	m.ReviewState.Toggle(path, blob, time.Now())
+	f := m.fileAt(m.cursor)
+	blob := m.BlobByPath[f.Path]
+	m.ReviewState.Toggle(f.Path, blob, time.Now())
 	if m.ReviewStore != nil {
 		_ = m.ReviewStore.Save(m.RepoOwner, m.RepoName, m.ReviewState)
 	}
 	// Invalidate sidebar cache so the checkmark redraws on the next frame.
 	m.rc.sideRows = nil
+}
+
+// startWaiver opens the waiver textinput on a CI-risk file. No-op if the
+// current row isn't CI-touching.
+func (m Model) startWaiver() (tea.Model, tea.Cmd) {
+	if m.cursor >= len(m.Files) {
+		return m, nil
+	}
+	f := m.fileAt(m.cursor)
+	if m.CISignals[f.Path].Risk == CIRiskNone {
+		return m, nil
+	}
+	ti := textinput.New()
+	ti.Placeholder = "reason for waiving CI-risk check"
+	ti.Focus()
+	ti.CharLimit = 200
+	ti.Width = 60
+	m.waiverInput = ti
+	m.enteringWaiver = true
+	return m, textinput.Blink
+}
+
+func (m Model) updateWaiver(key tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch key.String() {
+	case "enter":
+		reason := strings.TrimSpace(m.waiverInput.Value())
+		m.enteringWaiver = false
+		if reason == "" {
+			return m, nil
+		}
+		f := m.fileAt(m.cursor)
+		blob := m.BlobByPath[f.Path]
+		if m.ReviewState != nil {
+			m.ReviewState.Set(f.Path, blob, reason, time.Now())
+			if m.ReviewStore != nil {
+				_ = m.ReviewStore.Save(m.RepoOwner, m.RepoName, m.ReviewState)
+			}
+			m.rc.sideRows = nil
+		}
+		return m, nil
+	case "esc":
+		m.enteringWaiver = false
+		return m, nil
+	}
+	var cmd tea.Cmd
+	m.waiverInput, cmd = m.waiverInput.Update(key)
+	return m, cmd
 }
 
 // jumpToNextUnreviewed advances the cursor to the next file that hasn't
@@ -437,7 +602,7 @@ func (m *Model) jumpToNextUnreviewed() {
 	n := len(m.Files)
 	for i := 1; i <= n; i++ {
 		idx := (m.cursor + i) % n
-		if !m.ReviewState.IsChecked(m.Files[idx].Path) {
+		if !m.ReviewState.IsChecked(m.fileAt(idx).Path) {
 			m.cursor = idx
 			m.scrollY = 0
 			m.rc.fileIdx = -1 // force cache rebuild
@@ -478,7 +643,7 @@ func (m *Model) renderDiffCached() string {
 	if w <= 0 || h <= 0 || m.cursor >= len(m.Files) {
 		return ""
 	}
-	f := m.Files[m.cursor]
+	f := m.fileAt(m.cursor)
 	contentH := h - 2
 	if contentH < 1 {
 		contentH = 1
@@ -875,7 +1040,7 @@ func (m Model) maxScroll() int {
 	if m.cursor >= len(m.Files) {
 		return 0
 	}
-	n := len(m.Files[m.cursor].Lines) - m.diffContentHeight()
+	n := len(m.fileAt(m.cursor).Lines) - m.diffContentHeight()
 	if n < 0 {
 		return 0
 	}
