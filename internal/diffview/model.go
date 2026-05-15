@@ -19,6 +19,29 @@ type Model struct {
 	cursor   int // file index in sidebar
 	scrollY  int // line index at top of diff pane
 	quitting bool
+
+	// Render cache: scrolling and tabbing are hot paths, so we pre-render the
+	// expensive (chroma + lipgloss) work per file/width and reuse it on every
+	// frame. Invalidated when cursor or width changes.
+	rc renderCache
+}
+
+// renderCache stores fully pre-formatted strings — ready to write straight to
+// the screen — for the current file at the current geometry. A frame at
+// steady state is then just slicing into rc.lines.
+type renderCache struct {
+	fileIdx  int
+	width    int
+	sideW    int
+	diffW    int
+	bodyH    int
+	lines    []string // pre-rendered content lines for the current file
+	emptyRow string   // pre-rendered empty diff-pane row at current width
+	emptySide string  // pre-rendered empty sidebar row at current width
+	fileHdr  string   // pre-rendered "FILES" sidebar header
+	sideRows []string // pre-rendered sidebar rows (one per file)
+	// File-header bar text for the current file.
+	pathHdr string
 }
 
 // Color palette — dark theme, hunk-inspired.
@@ -32,14 +55,20 @@ var (
 	colorFaint   = lipgloss.Color("245") // faint context
 	colorBright  = lipgloss.Color("255") // selected sidebar row
 
-	// Backgrounds: kept subtle so chroma's foreground tokens stay readable.
-	bgChrome  = lipgloss.Color("236") // top header / keybinding bar
-	bgPane    = lipgloss.Color("234") // diff pane / sidebar background
-	bgFileHdr = lipgloss.Color("237") // per-file path header
-	bgSel     = lipgloss.Color("238") // sidebar selected row
-	bgHunk    = lipgloss.Color("235") // hunk header background
-	bgAdd     = lipgloss.Color("22")  // dark green for + lines
-	bgDel     = lipgloss.Color("52")  // dark red for - lines
+	// Backgrounds — hex truecolor so we can pick muted forest-green and
+	// wine-red tints that read as "diff state" rather than "warning sign".
+	// Tuned against Claude Code's diff palette; the goal is calm contrast,
+	// not stoplight saturation.
+	bgChrome   = lipgloss.Color("#2a2a2a") // top header / keybinding bar
+	bgPane     = lipgloss.Color("#1c1c1c") // diff pane / sidebar background
+	bgFileHdr  = lipgloss.Color("#2e2e2e") // per-file path header
+	bgSel      = lipgloss.Color("#3a3a3a") // sidebar selected row
+	bgHunk     = lipgloss.Color("#262638") // hunk header background (cool blue-grey)
+	bgAdd      = lipgloss.Color("#143020") // muted forest green for + lines
+	bgDel      = lipgloss.Color("#3a1a1a") // muted wine red for - lines
+	bgGutter   = lipgloss.Color("#161616") // line-number gutter background
+	bgAddGut   = lipgloss.Color("#0e2418") // gutter on + lines (slightly darker than bgAdd)
+	bgDelGut   = lipgloss.Color("#2e1414") // gutter on - lines (slightly darker than bgDel)
 )
 
 // Reusable styles. Width is applied at render time so panes can be sized
@@ -59,6 +88,9 @@ var (
 	styleSidebarSel = lipgloss.NewStyle().Background(bgSel).Foreground(colorBright).Bold(true)
 	styleKey      = lipgloss.NewStyle().Background(bgChrome).Foreground(colorPink).Bold(true)
 	styleKeyDim   = lipgloss.NewStyle().Background(bgChrome).Foreground(colorFaint)
+	styleGutter   = lipgloss.NewStyle().Background(bgGutter).Foreground(colorFaint)
+	styleAddGut   = lipgloss.NewStyle().Background(bgAddGut).Foreground(colorFaint)
+	styleDelGut   = lipgloss.NewStyle().Background(bgDelGut).Foreground(colorFaint)
 )
 
 const (
@@ -124,6 +156,40 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+func (m *Model) ensureCache() {
+	want := renderCache{
+		fileIdx: m.cursor,
+		width:   m.width,
+		bodyH:   m.bodyHeight(),
+		sideW:   m.sidebarWidth(),
+	}
+	want.diffW = m.width - want.sideW
+	if m.rc.fileIdx == want.fileIdx &&
+		m.rc.width == want.width &&
+		m.rc.sideW == want.sideW &&
+		m.rc.diffW == want.diffW &&
+		m.rc.bodyH == want.bodyH &&
+		len(m.rc.lines) > 0 {
+		return
+	}
+
+	want.emptyRow = stylePaneBg.Width(want.diffW).Render("")
+	want.emptySide = styleFaintBg.Width(want.sideW).Render("")
+	want.fileHdr = styleFileHdr.Width(want.sideW).Render(" FILES")
+
+	// Pre-render the diff content lines for the current file.
+	if m.cursor < len(m.Files) {
+		f := m.Files[m.cursor]
+		want.pathHdr = renderFileHeader(f, want.diffW)
+		want.lines = m.renderFileLines(f, want.diffW)
+	}
+
+	// Pre-render sidebar rows.
+	want.sideRows = m.buildSidebarRows(want.sideW)
+
+	m.rc = want
+}
+
 func (m Model) View() string {
 	if m.quitting {
 		return ""
@@ -132,15 +198,16 @@ func (m Model) View() string {
 		return styleChrome.Width(m.width).Render(" no changes in this PR ")
 	}
 
-	sideW := m.sidebarWidth()
-	diffW := m.width - sideW
-	bodyH := m.bodyHeight()
+	// View is a value receiver in bubbletea; we touch the cache via a
+	// pointer-local copy to avoid copying the renderCache slice each frame.
+	mp := &m
+	mp.ensureCache()
 
-	header := m.renderTopBar()
-	sidebar := m.renderSidebar(sideW, bodyH)
-	diff := m.renderDiff(diffW, bodyH)
+	header := mp.renderTopBar()
+	sidebar := mp.renderSidebarCached()
+	diff := mp.renderDiffCached()
 	body := lipgloss.JoinHorizontal(lipgloss.Top, sidebar, diff)
-	keys := m.renderKeybindings(m.width)
+	keys := mp.renderKeybindings(m.width)
 
 	return header + "\n" + body + "\n" + keys
 }
@@ -159,20 +226,18 @@ func (m Model) renderTopBar() string {
 // Sidebar
 // ---------------------------------------------------------------------------
 
-func (m Model) renderSidebar(w, h int) string {
-	if w <= 0 || h <= 0 {
-		return ""
+// buildSidebarRows pre-renders one styled string per file plus a header. The
+// rows are reused frame-to-frame and only rebuilt when width or cursor moves.
+func (m Model) buildSidebarRows(w int) []string {
+	if w <= 0 {
+		return nil
 	}
-	var lines []string
-	lines = append(lines, styleFileHdr.Width(w).Render(" FILES"))
-
-	// Width budget: " ▸ " (3) + name + " " + "+ddd -ddd" (10) + right pad
+	rows := make([]string, 0, len(m.Files))
 	const countsW = 11
 	nameW := w - 3 - 1 - countsW
 	if nameW < 6 {
 		nameW = 6
 	}
-
 	for i, f := range m.Files {
 		name := truncatePath(f.Path, nameW)
 		counts := fmt.Sprintf("+%-3d -%-3d", f.Adds, f.Dels)
@@ -182,25 +247,37 @@ func (m Model) renderSidebar(w, h int) string {
 			counts,
 		)
 		if i == m.cursor {
-			lines = append(lines, styleSidebarSel.Width(w).Render(row))
+			rows = append(rows, styleSidebarSel.Width(w).Render(row))
 		} else {
-			lines = append(lines, styleFaintBg.Width(w).Render(row))
+			rows = append(rows, styleFaintBg.Width(w).Render(row))
 		}
 	}
+	return rows
+}
 
-	// Pad to bodyHeight - 1 (we'll cap with a footer row below).
-	for len(lines) < h-1 {
-		lines = append(lines, styleFaintBg.Width(w).Render(""))
+func (m *Model) renderSidebarCached() string {
+	w := m.rc.sideW
+	h := m.rc.bodyH
+	if w <= 0 || h <= 0 {
+		return ""
 	}
-	// Footer.
+	out := make([]string, 0, h)
+	out = append(out, m.rc.fileHdr)
+	for _, r := range m.rc.sideRows {
+		if len(out) >= h-1 {
+			break
+		}
+		out = append(out, r)
+	}
+	for len(out) < h-1 {
+		out = append(out, m.rc.emptySide)
+	}
 	footer := fmt.Sprintf(" %d file%s", len(m.Files), pluralS(len(m.Files)))
-	lines = append(lines, styleFileHdr.Width(w).Render(footer))
-
-	// Crop if we somehow overshot.
-	if len(lines) > h {
-		lines = lines[:h]
+	out = append(out, styleFileHdr.Width(w).Render(footer))
+	if len(out) > h {
+		out = out[:h]
 	}
-	return strings.Join(lines, "\n")
+	return strings.Join(out, "\n")
 }
 
 func selectionMarker(selected bool) string {
@@ -214,46 +291,40 @@ func selectionMarker(selected bool) string {
 // Diff pane
 // ---------------------------------------------------------------------------
 
-func (m Model) renderDiff(w, h int) string {
+// renderDiffCached slices into the pre-rendered file lines and assembles the
+// diff pane. Hot path — no chroma or lipgloss work here.
+func (m *Model) renderDiffCached() string {
+	w := m.rc.diffW
+	h := m.rc.bodyH
 	if w <= 0 || h <= 0 || m.cursor >= len(m.Files) {
 		return ""
 	}
 	f := m.Files[m.cursor]
-
-	// One row for the file path header, one for the hunk-position footer.
 	contentH := h - 2
 	if contentH < 1 {
 		contentH = 1
 	}
-
 	end := m.scrollY + contentH
-	if end > len(f.Lines) {
-		end = len(f.Lines)
+	if end > len(m.rc.lines) {
+		end = len(m.rc.lines)
 	}
 
-	var lines []string
-
-	// Top-of-pane header — file path on the left, +/- counts on the right.
-	lines = append(lines, m.renderFileHeader(f, w))
-
-	// Diff content.
+	lines := make([]string, 0, h)
+	lines = append(lines, m.rc.pathHdr)
 	for i := m.scrollY; i < end; i++ {
-		lines = append(lines, m.renderDiffLine(f.Lines[i], f.Path, w))
+		lines = append(lines, m.rc.lines[i])
 	}
-	// Pad with subtle background so we don't render into a void.
 	for len(lines) < h-1 {
-		lines = append(lines, stylePaneBg.Width(w).Render(""))
+		lines = append(lines, m.rc.emptyRow)
 	}
-	// Bottom footer — file counter + scroll position. Keeps the pane bounded.
 	lines = append(lines, m.renderDiffFooter(f, w))
-
 	if len(lines) > h {
 		lines = lines[:h]
 	}
 	return strings.Join(lines, "\n")
 }
 
-func (m Model) renderFileHeader(f File, w int) string {
+func renderFileHeader(f File, w int) string {
 	left := " " + f.Path
 	right := fmt.Sprintf("+%d -%d ", f.Adds, f.Dels)
 	gap := w - lipgloss.Width(left) - lipgloss.Width(right)
@@ -282,33 +353,121 @@ func fileCountStr(cur, total int) string {
 	return fmt.Sprintf("file %d/%d", cur, total)
 }
 
-// renderDiffLine renders one diff line padded to the full pane width, with
-// full-width background coloring so the diff state extends to the right edge.
-func (m Model) renderDiffLine(l Line, path string, w int) string {
+// renderFileLines walks a file's diff once, tracking old/new line numbers as
+// it goes, and produces one fully-styled string per displayable line. Hunk
+// headers reset the counters; file headers are dropped.
+func (m Model) renderFileLines(f File, w int) []string {
+	out := make([]string, 0, len(f.Lines))
+	var oldNo, newNo int
+	for _, l := range f.Lines {
+		switch l.Kind {
+		case LineFile:
+			// Drop — we already have the file-path header bar above.
+			continue
+		case LineHunk:
+			oldNo, newNo = parseHunkStart(l.Text)
+			out = append(out, styleHunkLine.Width(w).Render(" "+l.Text))
+		case LineAdd:
+			out = append(out, m.styledRow(l, f.Path, 0, newNo, w))
+			newNo++
+		case LineDel:
+			out = append(out, m.styledRow(l, f.Path, oldNo, 0, w))
+			oldNo++
+		case LineContext:
+			out = append(out, m.styledRow(l, f.Path, oldNo, newNo, w))
+			oldNo++
+			newNo++
+		case LineNoNewLine:
+			out = append(out, styleFaintBg.Width(w).Render("        "+l.Text))
+		default:
+			out = append(out, stylePaneBg.Width(w).Render(l.Text))
+		}
+	}
+	return out
+}
+
+// styledRow renders one content row of the diff: line-number gutter on the
+// left, then the line itself with a subtle background tint by kind. Old / new
+// number columns are 4 chars each; pass 0 to render that column as blanks.
+func (m Model) styledRow(l Line, path string, oldNo, newNo, w int) string {
+	body := m.highlightForBg(path, stripMarker(l.Text))
+
+	gutterText := fmt.Sprintf("%s %s ", numCol(oldNo), numCol(newNo))
+
+	var gutterStyle, lineStyle, markerStyle lipgloss.Style
+	var marker string
+
 	switch l.Kind {
 	case LineAdd:
-		body := stripMarker(l.Text)
-		hl := m.highlightForBg(path, body)
-		return styleAddLine.Width(w).Render(styleAddMark.Render("+") + " " + hl)
+		gutterStyle = styleAddGut
+		lineStyle = styleAddLine
+		markerStyle = styleAddMark
+		marker = "+"
 	case LineDel:
-		body := stripMarker(l.Text)
-		hl := m.highlightForBg(path, body)
-		return styleDelLine.Width(w).Render(styleDelMark.Render("-") + " " + hl)
-	case LineContext:
-		body := stripMarker(l.Text)
-		hl := m.highlightForBg(path, body)
-		return stylePaneBg.Width(w).Render("  " + hl)
-	case LineHunk:
-		return styleHunkLine.Width(w).Render(" " + l.Text)
-	case LineNoNewLine:
-		return styleFaintBg.Width(w).Render(" " + l.Text)
-	case LineFile:
-		// Skip raw "--- a/foo" / "+++ b/foo" / "index abc..def" lines —
-		// they're redundant with the per-file header.
-		return ""
+		gutterStyle = styleDelGut
+		lineStyle = styleDelLine
+		markerStyle = styleDelMark
+		marker = "-"
 	default:
-		return stylePaneBg.Width(w).Render(l.Text)
+		gutterStyle = styleGutter
+		lineStyle = stylePaneBg
+		markerStyle = styleGutter
+		marker = " "
 	}
+
+	gutter := gutterStyle.Render(gutterText)
+	mark := markerStyle.Render(marker + " ")
+	contentW := w - lipgloss.Width(gutter) - lipgloss.Width(mark)
+	if contentW < 1 {
+		contentW = 1
+	}
+	content := lineStyle.Width(contentW).Render(body)
+	return gutter + mark + content
+}
+
+// numCol formats a line number into a 4-char right-aligned column, or four
+// spaces when the number is 0 (i.e. the row doesn't exist on that side).
+func numCol(n int) string {
+	if n == 0 {
+		return "    "
+	}
+	return fmt.Sprintf("%4d", n)
+}
+
+// parseHunkStart pulls the starting old-line and new-line numbers out of a
+// hunk header like "@@ -56,4 +56,4 @@ jobs:". Returns 0,0 on parse failure.
+func parseHunkStart(s string) (int, int) {
+	// Look for "-N" then "+N" within the @@ ... @@ section.
+	var oldStart, newStart int
+	at := strings.Index(s, "@@")
+	if at < 0 {
+		return 0, 0
+	}
+	rest := s[at+2:]
+	end := strings.Index(rest, "@@")
+	if end < 0 {
+		end = len(rest)
+	}
+	rest = rest[:end]
+	for _, tok := range strings.Fields(rest) {
+		if len(tok) < 2 {
+			continue
+		}
+		sign := tok[0]
+		num := tok[1:]
+		if i := strings.IndexByte(num, ','); i >= 0 {
+			num = num[:i]
+		}
+		var v int
+		fmt.Sscanf(num, "%d", &v)
+		switch sign {
+		case '-':
+			oldStart = v
+		case '+':
+			newStart = v
+		}
+	}
+	return oldStart, newStart
 }
 
 // highlightForBg runs chroma on the body, then strips ANSI resets so the

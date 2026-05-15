@@ -62,6 +62,24 @@ func TestParse_LineKinds(t *testing.T) {
 	}
 }
 
+func TestParseHunkStart(t *testing.T) {
+	cases := []struct {
+		in       string
+		old, new int
+	}{
+		{"@@ -56,4 +56,4 @@ jobs:", 56, 56},
+		{"@@ -0,0 +1,3 @@", 0, 1},
+		{"@@ -10,7 +12,9 @@", 10, 12},
+		{"not a hunk", 0, 0},
+	}
+	for _, c := range cases {
+		o, n := parseHunkStart(c.in)
+		if o != c.old || n != c.new {
+			t.Errorf("parseHunkStart(%q) = (%d, %d), want (%d, %d)", c.in, o, n, c.old, c.new)
+		}
+	}
+}
+
 func TestParse_EmptyInput(t *testing.T) {
 	files := Parse("")
 	if files != nil {
