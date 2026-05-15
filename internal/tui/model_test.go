@@ -255,6 +255,80 @@ func TestRenameFlow_NoPRNumberDisablesRename(t *testing.T) {
 	}
 }
 
+func TestDerivedState(t *testing.T) {
+	now := time.Date(2026, 5, 14, 0, 0, 0, 0, time.UTC)
+	mergedParent := &Layer{PRNumber: 1, PRState: "MERGED"}
+	openApprovedParent := &Layer{PRNumber: 1, PRState: "OPEN", CIStatus: "SUCCESS", ReviewDecision: "APPROVED"}
+	failingParent := &Layer{PRNumber: 1, PRState: "OPEN", CIStatus: "FAILURE", ReviewDecision: "REVIEW_REQUIRED"}
+	unreviewedParent := &Layer{PRNumber: 1, PRState: "OPEN", CIStatus: "SUCCESS", ReviewDecision: "REVIEW_REQUIRED"}
+
+	cases := []struct {
+		name   string
+		layer  Layer
+		parent *Layer
+		want   string
+	}{
+		{"no PR", Layer{}, nil, ""},
+		{"merged", Layer{PRNumber: 1, PRState: "MERGED"}, nil, "merged"},
+		{"failing beats everything", Layer{PRNumber: 1, PRState: "OPEN", CIStatus: "FAILURE", ReviewDecision: "APPROVED"}, mergedParent, "failing"},
+		{"blocked by failing parent", Layer{PRNumber: 2, PRState: "OPEN", CIStatus: "SUCCESS", ReviewDecision: "APPROVED"}, failingParent, "blocked"},
+		{"blocked by unreviewed parent", Layer{PRNumber: 2, PRState: "OPEN", CIStatus: "SUCCESS", ReviewDecision: "APPROVED"}, unreviewedParent, "blocked"},
+		// Even with an approved, passing parent — child can't be "ready" until
+		// the parent actually merges. So it falls to "open".
+		{"approved parent not yet merged → open", Layer{PRNumber: 2, PRState: "OPEN", CIStatus: "SUCCESS", ReviewDecision: "APPROVED"}, openApprovedParent, "open"},
+		{"ready when root, approved, CI passing", Layer{PRNumber: 1, PRState: "OPEN", CIStatus: "SUCCESS", ReviewDecision: "APPROVED"}, nil, "ready"},
+		{"ready with merged parent", Layer{PRNumber: 2, PRState: "OPEN", CIStatus: "SUCCESS", ReviewDecision: "APPROVED"}, mergedParent, "ready"},
+		{"stale when open >7d", Layer{PRNumber: 1, PRState: "OPEN", CIStatus: "SUCCESS", UpdatedAt: "2026-05-01T00:00:00Z"}, nil, "stale"},
+		{"not stale at 5d", Layer{PRNumber: 1, PRState: "OPEN", CIStatus: "SUCCESS", UpdatedAt: "2026-05-09T00:00:00Z"}, nil, "open"},
+		{"open catch-all", Layer{PRNumber: 1, PRState: "OPEN", CIStatus: "SUCCESS", ReviewDecision: "REVIEW_REQUIRED"}, nil, "open"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := derivedState(c.layer, c.parent, now)
+			if got != c.want {
+				t.Errorf("derivedState = %q, want %q", got, c.want)
+			}
+		})
+	}
+}
+
+func TestFindParent_StackMode(t *testing.T) {
+	layers := []Layer{
+		{Stack: "a", Branch: "a1", PRNumber: 1},
+		{Stack: "a", Branch: "a2", PRNumber: 2},
+		{Stack: "b", Branch: "b1", PRNumber: 3},
+	}
+	if p := findParent(layers, 0); p != nil {
+		t.Errorf("idx 0 should have no parent, got %+v", p)
+	}
+	if p := findParent(layers, 1); p == nil || p.Branch != "a1" {
+		t.Errorf("idx 1 parent should be a1, got %+v", p)
+	}
+	// idx 2 is in a different stack — no parent.
+	if p := findParent(layers, 2); p != nil {
+		t.Errorf("idx 2 should have no parent (different stack), got %+v", p)
+	}
+}
+
+func TestFindParent_TreeMode(t *testing.T) {
+	layers := []Layer{
+		{Branch: "root1", Depth: 0},
+		{Branch: "child1a", Depth: 1},
+		{Branch: "child1b", Depth: 1},
+		{Branch: "grandchild", Depth: 2},
+		{Branch: "root2", Depth: 0},
+	}
+	if p := findParent(layers, 3); p == nil || p.Branch != "child1b" {
+		t.Errorf("grandchild parent should be child1b, got %+v", p)
+	}
+	if p := findParent(layers, 1); p == nil || p.Branch != "root1" {
+		t.Errorf("child1a parent should be root1, got %+v", p)
+	}
+	if p := findParent(layers, 4); p != nil {
+		t.Errorf("root2 should have no parent (depth 0 in tree mode), got %+v", p)
+	}
+}
+
 // stripANSI removes ANSI escape sequences so assertions don't depend on
 // lipgloss styling.
 func stripANSI(s string) string {

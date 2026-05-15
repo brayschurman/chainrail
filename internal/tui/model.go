@@ -129,6 +129,99 @@ var (
 
 func (m Model) Result() Result { return m.result }
 
+// findParent returns the layer that the given index's PR is stacked onto, or
+// nil if it's a root. Works for both stack mode (prior layer in same stack)
+// and tree mode (most recent earlier layer with Depth = l.Depth - 1).
+func findParent(layers []Layer, idx int) *Layer {
+	if idx <= 0 || idx >= len(layers) {
+		return nil
+	}
+	cur := layers[idx]
+	if cur.Depth > 0 {
+		// Tree mode: walk back to the first earlier layer with depth-1.
+		for j := idx - 1; j >= 0; j-- {
+			if layers[j].Depth == cur.Depth-1 {
+				return &layers[j]
+			}
+		}
+		return nil
+	}
+	// cur.Depth == 0. If any earlier layer has Depth > 0, we're in tree mode
+	// and depth-0 rows are independent roots — no parent.
+	for j := 0; j < idx; j++ {
+		if layers[j].Depth > 0 {
+			return nil
+		}
+	}
+	// Stack mode: previous layer in the same stack.
+	prev := layers[idx-1]
+	if prev.Stack == cur.Stack {
+		return &prev
+	}
+	return nil
+}
+
+// derivedState collapses CIStatus, ReviewDecision, parent state, and
+// staleness into a single headline word per row.
+func derivedState(l Layer, parent *Layer, now time.Time) string {
+	if l.PRNumber == 0 {
+		return ""
+	}
+	if l.PRState == "MERGED" {
+		return "merged"
+	}
+	if l.PRState != "OPEN" {
+		return strings.ToLower(l.PRState)
+	}
+	if l.CIStatus == "FAILURE" {
+		return "failing"
+	}
+	parentBlocks := parent != nil && parent.PRNumber > 0 && parent.PRState == "OPEN" &&
+		(parent.CIStatus == "FAILURE" || parent.ReviewDecision != "APPROVED")
+	if parentBlocks {
+		return "blocked"
+	}
+	parentOk := parent == nil || parent.PRNumber == 0 || parent.PRState == "MERGED"
+	if l.ReviewDecision == "APPROVED" && l.CIStatus == "SUCCESS" && parentOk {
+		return "ready"
+	}
+	if l.UpdatedAt != "" {
+		if t, err := time.Parse(time.RFC3339, l.UpdatedAt); err == nil {
+			if int(now.Sub(t).Hours()/24) > 7 {
+				return "stale"
+			}
+		}
+	}
+	return "open"
+}
+
+// renderState renders the derived state with appropriate color. Pads to 8
+// chars so the badges line up across rows.
+func renderState(state string, selected bool) string {
+	var style lipgloss.Style
+	switch state {
+	case "merged":
+		style = styleMerged
+	case "ready":
+		style = styleMerged
+	case "failing":
+		style = styleStale
+	case "blocked":
+		style = styleWarn
+	case "stale":
+		style = styleFaint
+	case "open":
+		style = styleOpen
+	default:
+		style = styleFaint
+	}
+	text := fmt.Sprintf("%-8s", state)
+	if selected {
+		return styleSel.Render(text)
+	}
+	return style.Render(text)
+}
+
 // renderTabBar renders a horizontal tab bar with the active tab highlighted.
 func renderTabBar(tabs []Tab, active int) string {
 	parts := make([]string, len(tabs))
@@ -446,14 +539,8 @@ func (m Model) View() string {
 			} else {
 				b.WriteString(styleFaint.Render(prNum))
 			}
-			switch l.PRState {
-			case "MERGED":
-				b.WriteString(styleMerged.Render("✓ merged"))
-			case "OPEN":
-				b.WriteString(styleOpen.Render("● open  "))
-			default:
-				b.WriteString(styleFaint.Render(l.PRState))
-			}
+			parent := findParent(m.Layers, i)
+			b.WriteString(renderState(derivedState(l, parent, Now()), sel))
 		} else {
 			nopr := "  no PR yet"
 			if sel {
