@@ -28,6 +28,22 @@ type GitHubClient interface {
 	// PRDiff returns the unified diff for a PR as a single string,
 	// equivalent to `gh pr diff <number> --patch`.
 	PRDiff(ctx context.Context, number int) (string, error)
+	// PRFiles returns each file in a PR along with its blob SHA after the
+	// change. Used for content-hash review state.
+	PRFiles(ctx context.Context, number int) ([]PRFile, error)
+	// RepoInfo returns the owner/name of the current repo, derived from the
+	// `gh` CLI's repo resolution (i.e. respects $GH_REPO or the local
+	// remote).
+	RepoInfo(ctx context.Context) (owner, name string, err error)
+}
+
+// PRFile is one file's metadata from a PR — enough to drive per-file
+// review state and basic diff summaries.
+type PRFile struct {
+	Path      string
+	BlobSHA   string
+	Additions int
+	Deletions int
 }
 
 type PullRequest struct {

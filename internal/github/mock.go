@@ -13,6 +13,9 @@ type MockGhClient struct {
 	reviewRequested    map[int]bool
 	changesSinceReview map[int]int
 	prDiffs            map[int]string
+	prFiles            map[int][]PRFile
+	repoOwner          string
+	repoName           string
 }
 
 func NewMock() *MockGhClient {
@@ -158,6 +161,33 @@ func (m *MockGhClient) UpdatePRBody(_ context.Context, number int, body string) 
 	pr.Body = body
 	m.PRs[number] = pr
 	return nil
+}
+
+func (m *MockGhClient) RepoInfo(_ context.Context) (string, string, error) {
+	m.record("RepoInfo")
+	if m.repoOwner == "" {
+		return "test-owner", "test-repo", nil
+	}
+	return m.repoOwner, m.repoName, nil
+}
+
+// SetRepoInfo overrides the mock's repo owner/name.
+func (m *MockGhClient) SetRepoInfo(owner, name string) {
+	m.repoOwner = owner
+	m.repoName = name
+}
+
+// SetPRFiles lets tests inject the files list for a PR.
+func (m *MockGhClient) SetPRFiles(number int, files []PRFile) {
+	if m.prFiles == nil {
+		m.prFiles = map[int][]PRFile{}
+	}
+	m.prFiles[number] = files
+}
+
+func (m *MockGhClient) PRFiles(_ context.Context, number int) ([]PRFile, error) {
+	m.record(fmt.Sprintf("PRFiles(%d)", number))
+	return m.prFiles[number], nil
 }
 
 // PRDiffs lets tests inject fixture diffs per PR number.

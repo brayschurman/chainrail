@@ -341,6 +341,56 @@ func (c *GhCli) UpdatePRBody(_ context.Context, number int, body string) error {
 	return nil
 }
 
+func (c *GhCli) RepoInfo(_ context.Context) (string, string, error) {
+	out, err := c.run("gh", "repo", "view", "--json", "owner,name",
+		"--jq", `.owner.login + "/" + .name`)
+	if err != nil {
+		return "", "", wrapGhErr(err, "gh repo view --json owner,name")
+	}
+	parts := strings.SplitN(strings.TrimSpace(string(out)), "/", 2)
+	if len(parts) != 2 {
+		return "", "", fmt.Errorf("unexpected repo info: %q", string(out))
+	}
+	return parts[0], parts[1], nil
+}
+
+func (c *GhCli) PRFiles(_ context.Context, number int) ([]PRFile, error) {
+	out, err := c.run("gh", "api",
+		fmt.Sprintf("repos/{owner}/{repo}/pulls/%d/files", number),
+		"--paginate",
+	)
+	if err != nil {
+		return nil, wrapGhErr(err, fmt.Sprintf("gh api pulls/%d/files", number))
+	}
+	var raw []struct {
+		Filename  string `json:"filename"`
+		SHA       string `json:"sha"`
+		Additions int    `json:"additions"`
+		Deletions int    `json:"deletions"`
+	}
+	// --paginate concatenates multiple JSON arrays. Wrap and re-parse.
+	body := strings.TrimSpace(string(out))
+	if strings.Contains(body, "][") {
+		body = "[" + strings.ReplaceAll(body, "][", ",") + "]"
+		body = strings.TrimPrefix(body, "[[")
+		body = strings.TrimSuffix(body, "]]")
+		body = "[" + body + "]"
+	}
+	if err := json.Unmarshal([]byte(body), &raw); err != nil {
+		return nil, fmt.Errorf("parse pr files: %w", err)
+	}
+	files := make([]PRFile, len(raw))
+	for i, r := range raw {
+		files[i] = PRFile{
+			Path:      r.Filename,
+			BlobSHA:   r.SHA,
+			Additions: r.Additions,
+			Deletions: r.Deletions,
+		}
+	}
+	return files, nil
+}
+
 func (c *GhCli) PRDiff(_ context.Context, number int) (string, error) {
 	out, err := c.run("gh", "pr", "diff", strconv.Itoa(number), "--patch")
 	if err != nil {

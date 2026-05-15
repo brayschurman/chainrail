@@ -3,7 +3,9 @@ package diffview
 import (
 	"fmt"
 	"strings"
+	"time"
 
+	"github.com/brayschurman/chainrail/internal/reviewstate"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
@@ -15,6 +17,18 @@ type Model struct {
 	width       int
 	height      int
 	highlighter *Highlighter
+
+	// BlobByPath maps file path -> blob SHA for the PR's current head, used
+	// to detect "changed since you checked" against persisted review state.
+	BlobByPath map[string]string
+
+	// ReviewState is the loaded per-file checklist for this PR. Optional;
+	// when nil, review-tracking UI is hidden entirely. The owner+repo+number
+	// fields are kept here so Save can write back to the right key.
+	ReviewState *reviewstate.PRState
+	ReviewStore *reviewstate.Store
+	RepoOwner   string
+	RepoName    string
 
 	cursor   int // file index in sidebar
 	scrollY  int // line index at top of diff pane
@@ -90,7 +104,10 @@ var (
 	styleDelLine  = lipgloss.NewStyle().Background(bgDel).Foreground(colorBright)
 	styleAddMark  = lipgloss.NewStyle().Background(bgAdd).Foreground(colorGreenFg).Bold(true)
 	styleDelMark  = lipgloss.NewStyle().Background(bgDel).Foreground(colorRedFg).Bold(true)
-	styleSidebarSel = lipgloss.NewStyle().Background(bgSel).Foreground(colorBright).Bold(true)
+	styleSidebarSel  = lipgloss.NewStyle().Background(bgSel).Foreground(colorBright).Bold(true)
+	styleSidebarDone = lipgloss.NewStyle().Background(bgPane).Foreground(lipgloss.Color("241")).Faint(true)
+	styleProgressOn  = lipgloss.NewStyle().Background(bgChrome).Foreground(lipgloss.Color("82")) // bright green
+	styleProgressOff = lipgloss.NewStyle().Background(bgChrome).Foreground(lipgloss.Color("238"))
 	styleKey      = lipgloss.NewStyle().Background(bgChrome).Foreground(colorPink).Bold(true)
 	styleKeyDim   = lipgloss.NewStyle().Background(bgChrome).Foreground(colorFaint)
 	styleGutter   = lipgloss.NewStyle().Background(bgGutter).Foreground(colorFaint)
@@ -164,6 +181,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.scrollY = 0
 		case "G", "end":
 			m.scrollY = m.maxScroll()
+		case "x":
+			m.toggleReviewed()
+		case "N":
+			m.jumpToNextUnreviewed()
 		}
 	}
 	if m.scrollY > m.maxScroll() {
@@ -234,8 +255,67 @@ func (m Model) View() string {
 
 func (m Model) renderTopBar() string {
 	left := " " + styleTitle.Render("chainrail") + "  " + styleHeading.Render(m.Title)
-	// styleChrome.Width pads with bg color to full width.
-	return styleChrome.Width(m.width).Render(left)
+
+	if m.ReviewState == nil {
+		return styleChrome.Width(m.width).Render(left)
+	}
+
+	done, total := m.reviewedCount()
+	if total == 0 {
+		return styleChrome.Width(m.width).Render(left)
+	}
+	pct := 0
+	if total > 0 {
+		pct = (done * 100) / total
+	}
+	bar := progressBar(done, total, 12)
+	elapsed := m.reviewElapsed()
+	right := bar + " " + styleChrome.Render(fmt.Sprintf("%d/%d (%d%%)", done, total, pct))
+	if elapsed != "" {
+		right += styleKeyDim.Render("  · " + elapsed)
+	}
+
+	// Pad left+right to fill width.
+	gap := m.width - lipgloss.Width(left) - lipgloss.Width(right) - 1
+	if gap < 1 {
+		gap = 1
+	}
+	return styleChrome.Render(left) + styleChrome.Render(strings.Repeat(" ", gap)) + right + styleChrome.Render(" ")
+}
+
+// progressBar renders a small ▰▰▰▱▱▱ bar of `width` cells.
+func progressBar(done, total, width int) string {
+	if total <= 0 || width <= 0 {
+		return ""
+	}
+	filled := (done * width) / total
+	if done > 0 && filled == 0 {
+		filled = 1
+	}
+	if filled > width {
+		filled = width
+	}
+	on := styleProgressOn.Render(strings.Repeat("▰", filled))
+	off := styleProgressOff.Render(strings.Repeat("▱", width-filled))
+	return on + off
+}
+
+// reviewElapsed returns "Nh Mm elapsed" since FirstCheckedAt, or "" if no
+// progress has started yet.
+func (m Model) reviewElapsed() string {
+	if m.ReviewState == nil || m.ReviewState.FirstCheckedAt.IsZero() {
+		return ""
+	}
+	d := time.Since(m.ReviewState.FirstCheckedAt)
+	if d < time.Minute {
+		return "just started"
+	}
+	h := int(d / time.Hour)
+	mins := int(d/time.Minute) % 60
+	if h == 0 {
+		return fmt.Sprintf("%dm elapsed", mins)
+	}
+	return fmt.Sprintf("%dh %dm elapsed", h, mins)
 }
 
 // ---------------------------------------------------------------------------
@@ -244,31 +324,67 @@ func (m Model) renderTopBar() string {
 
 // buildSidebarRows pre-renders one styled string per file plus a header. The
 // rows are reused frame-to-frame and only rebuilt when width or cursor moves.
+//
+// Layout per row: "▸ [✓] path  +A -D  Δ?". Reviewed files render faded.
 func (m Model) buildSidebarRows(w int) []string {
 	if w <= 0 {
 		return nil
 	}
 	rows := make([]string, 0, len(m.Files))
+
+	// Reserve: " " (1) + selection marker (1) + " " (1) + checkbox "[✓]" (3)
+	// + " " (1) + name + " " + "+ddd -ddd" (10).
 	const countsW = 11
-	nameW := w - 3 - 1 - countsW
+	const fixedW = 1 + 1 + 1 + 3 + 1 + 1 + countsW
+	nameW := w - fixedW
 	if nameW < 6 {
 		nameW = 6
 	}
+
 	for i, f := range m.Files {
 		name := truncatePath(f.Path, nameW)
 		counts := fmt.Sprintf("+%-3d -%-3d", f.Adds, f.Dels)
-		row := fmt.Sprintf(" %s %-*s %s",
+		box := m.checkboxFor(f.Path)
+		row := fmt.Sprintf(" %s %s %-*s %s",
 			selectionMarker(i == m.cursor),
+			box,
 			nameW, name,
 			counts,
 		)
-		if i == m.cursor {
+
+		// Tint by state.
+		switch {
+		case i == m.cursor:
 			rows = append(rows, styleSidebarSel.Width(w).Render(row))
-		} else {
+		case m.isReviewed(f.Path):
+			rows = append(rows, styleSidebarDone.Width(w).Render(row))
+		default:
 			rows = append(rows, styleFaintBg.Width(w).Render(row))
 		}
 	}
 	return rows
+}
+
+// checkboxFor returns the 3-char box marker for a file. "[✓]" reviewed,
+// "[ ]" not. "[~]" reviewed-but-changed-since (stale).
+func (m Model) checkboxFor(path string) string {
+	if m.ReviewState == nil {
+		return "[ ]"
+	}
+	if !m.ReviewState.IsChecked(path) {
+		return "[ ]"
+	}
+	if m.ReviewState.ChangedSince(path, m.BlobByPath[path]) {
+		return "[~]"
+	}
+	return "[✓]"
+}
+
+func (m Model) isReviewed(path string) bool {
+	if m.ReviewState == nil {
+		return false
+	}
+	return m.ReviewState.IsChecked(path) && !m.ReviewState.ChangedSince(path, m.BlobByPath[path])
 }
 
 func (m *Model) renderSidebarCached() string {
@@ -294,6 +410,53 @@ func (m *Model) renderSidebarCached() string {
 		out = out[:h]
 	}
 	return strings.Join(out, "\n")
+}
+
+// toggleReviewed flips the reviewed state for the current sidebar file.
+// Persists immediately so a crash or quit doesn't lose progress.
+func (m *Model) toggleReviewed() {
+	if m.ReviewState == nil || m.cursor >= len(m.Files) {
+		return
+	}
+	path := m.Files[m.cursor].Path
+	blob := m.BlobByPath[path]
+	m.ReviewState.Toggle(path, blob, time.Now())
+	if m.ReviewStore != nil {
+		_ = m.ReviewStore.Save(m.RepoOwner, m.RepoName, m.ReviewState)
+	}
+	// Invalidate sidebar cache so the checkmark redraws on the next frame.
+	m.rc.sideRows = nil
+}
+
+// jumpToNextUnreviewed advances the cursor to the next file that hasn't
+// been marked reviewed. Wraps to the top.
+func (m *Model) jumpToNextUnreviewed() {
+	if m.ReviewState == nil || len(m.Files) == 0 {
+		return
+	}
+	n := len(m.Files)
+	for i := 1; i <= n; i++ {
+		idx := (m.cursor + i) % n
+		if !m.ReviewState.IsChecked(m.Files[idx].Path) {
+			m.cursor = idx
+			m.scrollY = 0
+			m.rc.fileIdx = -1 // force cache rebuild
+			return
+		}
+	}
+}
+
+// reviewedCount returns how many of the PR's files have been marked done.
+func (m Model) reviewedCount() (done, total int) {
+	if m.ReviewState == nil {
+		return 0, len(m.Files)
+	}
+	for _, f := range m.Files {
+		if m.ReviewState.IsChecked(f.Path) {
+			done++
+		}
+	}
+	return done, len(m.Files)
 }
 
 func selectionMarker(selected bool) string {
@@ -645,10 +808,17 @@ func (m Model) renderKeybindings(w int) string {
 	parts := []string{
 		styleKey.Render("↑↓") + styleKeyDim.Render(" scroll"),
 		styleKey.Render("tab") + styleKeyDim.Render(" next file"),
-		styleKey.Render("shift+tab") + styleKeyDim.Render(" prev"),
+	}
+	if m.ReviewState != nil {
+		parts = append(parts,
+			styleKey.Render("x") + styleKeyDim.Render(" reviewed"),
+			styleKey.Render("N") + styleKeyDim.Render(" next unreviewed"),
+		)
+	}
+	parts = append(parts,
 		styleKey.Render("g/G") + styleKeyDim.Render(" top/bottom"),
 		styleKey.Render("q") + styleKeyDim.Render(" quit"),
-	}
+	)
 	sep := styleKeyDim.Render("  ·  ")
 	content := " " + strings.Join(parts, sep)
 	return styleChrome.Width(w).Render(content)

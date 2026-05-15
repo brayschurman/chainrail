@@ -10,6 +10,7 @@ import (
 	"github.com/brayschurman/chainrail/internal/diffview"
 	"github.com/brayschurman/chainrail/internal/github"
 	"github.com/brayschurman/chainrail/internal/output"
+	"github.com/brayschurman/chainrail/internal/reviewstate"
 	"github.com/brayschurman/chainrail/internal/term"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/spf13/cobra"
@@ -53,6 +54,30 @@ func runView(out io.Writer, r output.Renderer, number int, deps viewDeps) error 
 	files := diffview.Parse(diff)
 	title := fmt.Sprintf("#%d %s", pr.Number, pr.Title)
 	m := diffview.New(title, files)
+
+	// Best-effort review-state wiring. If any of these calls fail we skip
+	// the review UI entirely rather than refusing to open the viewer.
+	if owner, name, err := deps.gh.RepoInfo(ctx); err == nil {
+		if store, err := reviewstate.NewStore(); err == nil {
+			if st, err := store.Load(owner, name, number); err == nil {
+				m.RepoOwner = owner
+				m.RepoName = name
+				m.ReviewStore = store
+				m.ReviewState = st
+				if user, err := deps.gh.CurrentUser(ctx); err == nil && st.Reviewer == "" {
+					st.Reviewer = user
+				}
+			}
+			if prFiles, err := deps.gh.PRFiles(ctx, number); err == nil {
+				blobs := make(map[string]string, len(prFiles))
+				for _, f := range prFiles {
+					blobs[f.Path] = f.BlobSHA
+				}
+				m.BlobByPath = blobs
+			}
+		}
+	}
+
 	p := tea.NewProgram(m, tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
 		_ = os.Stderr
