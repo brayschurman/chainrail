@@ -1,16 +1,20 @@
 # chainrail 🚂
 
-Stacked PR management for GitHub. No squash-merge conflicts, no manual rebase dance.
+Ship smaller PRs. Review faster. Never fight a squash-merge conflict again.
 
-A lean CLI that organises your work as a chain of small, reviewable pull requests — and keeps the whole chain consistent when you merge one. Built while GitHub's native `gh stack` is still in private preview.
+[![Latest release](https://img.shields.io/github/v/release/brayschurman/chainrail?style=for-the-badge)](https://github.com/brayschurman/chainrail/releases)
+[![MIT License](https://img.shields.io/badge/License-MIT-blue.svg?style=for-the-badge)](LICENSE)
+[![Go](https://img.shields.io/badge/Go-1.21+-00ADD8?style=for-the-badge&logo=go)](https://go.dev)
+
+Chainrail organises your work into a chain of small, reviewable pull requests and keeps the whole chain healthy when things change — including when a parent PR gets squash-merged and GitHub would normally explode with false conflicts.
 
 ---
 
-## The problem
+## The problem 😤
 
-Your team uses squash-and-merge. You open a stacked PR. The parent gets merged — GitHub squashes it to a new SHA. Now every child branch shows the entire parent diff as "conflicts." You spend the next hour on `git rebase --onto` gymnastics.
+Your team uses squash-and-merge. You build a stacked PR. The parent gets merged — GitHub squashes it to a new commit. Now every child branch shows the entire parent diff as "conflicts." You spend the next hour doing git surgery.
 
-`cn sync` does that rebase for you, automatically, for every child in the chain.
+`cn sync` does that surgery for you, automatically, every time.
 
 ---
 
@@ -21,113 +25,119 @@ go install github.com/brayschurman/chainrail@latest
 alias cn=chainrail
 ```
 
-Requires **Go 1.21+** and the **`gh` CLI** installed and authenticated:
-
-```bash
-gh auth status
-```
+Requires **Go 1.21+** and the **`gh` CLI** installed and authenticated.
 
 ---
 
-## Quickstart
+## See your stack at a glance ✨
+
+Run `cn status` on any branch in your stack:
+
+```
+╭──────────────────────────────────────────────────────────────╮
+│                                                              │
+│   chainrail · dev-42                                         │
+│   ──────────────────────────────────────────────────         │
+│                                                              │
+│     1  bray/dev-42-1-schema    #12  ✓ merged                 │
+│   ▶ 2  bray/dev-42-2-api       #13  ● open                   │
+│     3  bray/dev-42-3-ui        #14  ● open  ⚠ needs sync     │
+│                                                              │
+│     q quit                                                   │
+│                                                              │
+╰──────────────────────────────────────────────────────────────╯
+```
+
+Color-coded PR states, sync warnings, and your current position — all live from GitHub. No more keeping the stack in your head.
+
+---
+
+## Quickstart 🚀
 
 ```bash
 # one-time setup per repo
 cn init --base main
 
-# build a stack
-cn add dev-42-schema     # creates bray/dev-42-1-schema, checks it out
-# ... implement, commit ...
-cn add dev-42-api        # creates bray/dev-42-2-api on top
-# ... implement, commit ...
-cn add dev-42-ui         # creates bray/dev-42-3-ui on top
+# build a stack, one layer at a time
+cn add feature-schema   # creates your-name/feature-1-schema and checks it out
+# ... write code, commit ...
+cn add feature-api      # stacks on top
+# ... write code, commit ...
+cn add feature-ui       # one more layer
+# ... write code, commit ...
 
-# open all three PRs with correct bases
+# open all PRs at once, with correct bases
 cn submit
 
-# someone reviews layer 2, you fix it, layer 3 needs to rebase
-cn sync
-
-# layer 1 gets squash-merged into main — cn sync detects the squash SHA
-# and runs rebase --onto automatically. no conflicts.
-cn sync
+# parent PR got squash-merged? just run:
+cn sync                 # chainrail figures out the rest
 ```
 
 ---
 
 ## Commands
 
-**`cn init --base <trunk>`**
-Registers the trunk branch in `.git/config`. Run once per repo. Safe to re-run (idempotent).
+**`cn init --base <trunk>`** — set up chainrail in your repo (once per clone)
 
-**`cn add <slug>`**
-Creates the next branch in the stack: `<user>/<base-slug>-<N>-<slug>`. Refuses to run with uncommitted changes.
+**`cn add <slug>`** — create the next branch in your stack
 
-**`cn submit`**
-Pushes every branch in the stack, opens pull requests with correct `--base` chains, and injects a stack-map into each PR body so reviewers can navigate. Idempotent — safe to re-run.
+**`cn submit`** — push all layers and open PRs with correct base chains
 
-**`cn sync`**
-Cascade-rebases the stack onto fresh trunk. Detects squash-merged parents and runs `git rebase --onto <squash_sha> <old_tip> <child>` automatically, then flips the PR's base on GitHub. Writes snapshot refs at `refs/chainrail/snapshot/<branch>` before touching anything.
+**`cn sync`** — rebase everything onto fresh trunk; handles squash-merged parents automatically
+
+**`cn status`** — open the TUI to see your full stack health at a glance
 
 ---
 
-## Stack-map in PR bodies
+## Stack map in every PR 🗺️
 
-`cn submit` injects a navigation block into every PR description:
+Every PR description gets a navigation block so reviewers know where they are:
 
 ```
-<!-- chainrail:stack:start -->
-**Stack** (bottom → top)
-1. bray/dev-42-1-schema ← you are here
-2. bray/dev-42-2-api
-3. bray/dev-42-3-ui
-<!-- chainrail:stack:end -->
+Stack (bottom → top)
+1. your-name/feature-1-schema ← you are here
+2. your-name/feature-2-api
+3. your-name/feature-3-ui
 ```
 
-Re-running `cn submit` updates the block in place — no duplicates.
+Rerunnning `cn submit` updates it in place — no duplicates.
 
 ---
 
-## Exit codes & errors
+## Working with agents 🤖
 
-All errors print to stderr as `Error [CODE]: message` with an optional `Suggestion: ...` line.
+Chainrail is built to be agent-friendly. If you're using Claude Code or another AI assistant, add the skill file so your agent understands stacked PR workflows automatically:
 
-| Code | Meaning |
-|------|---------|
-| `NOT_GIT_REPO` | not inside a git repo |
-| `NO_GH_AUTH` | `gh` is not authenticated |
-| `TRUNK_MISSING` | `cn init` hasn't been run |
-| `DIRTY_WORKTREE` | uncommitted changes; commit or stash first |
-| `NOT_ON_STACK` | current branch isn't a chainrail branch |
-| `SLUG_TAKEN` | that slug already exists in this stack |
-| `REBASE_CONFLICT` | conflict during rebase; resolve and re-run `cn sync` |
-| `GH_CALL_FAILED` | the `gh` CLI returned an error |
+```text
+Load the chainrail skill from .claude/skills/chainrail/SKILL.md and use it to manage my PR stack.
+```
 
-Exit `0` on success, `1` on any error.
+A good starting prompt:
 
----
+```text
+I want to split my current work into a stack of small PRs. Use chainrail to help me layer it — schema first, then API, then UI.
+```
 
-## Footguns
+The skill file teaches your agent when to reach for chainrail, how to decompose work into layers, and what to do when a parent PR gets merged.
 
-- Never `git checkout` to a non-stack branch between `cn add` calls — chainrail uses the current branch as the implicit parent.
-- Always commit before `cn add`.
-- `cn init --base <trunk>` must run once per clone — it's stored in `.git/config`, not committed.
-- On a rebase conflict, chainrail leaves the repo in mid-rebase state. Resolve conflicts, `git add`, `git rebase --continue`, then re-run `cn sync`.
-- Snapshot refs live at `refs/chainrail/snapshot/<branch>`. If a sync goes wrong you can recover with `git update-ref refs/heads/<branch> refs/chainrail/snapshot/<branch>`.
+For developers building on chainrail, see `AGENTS.md` for the full architectural guide.
 
 ---
 
-## v0.1 scope
+## How it compares
 
-What's in: `init`, `add`, `submit`, `sync`, squash-merge recovery.
+| Capability | chainrail | [Graphite](https://graphite.dev) | [ghstack](https://github.com/ezyang/ghstack) | Manual stacking | [gh stack](https://github.com/cli/cli) |
+|---|---|---|---|---|---|
+| Stacked PRs with correct bases | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Squash-merge conflict recovery | ✅ | ✅ | ❌ | ❌ | ✅ |
+| TUI stack health view | ✅ | ❌ | ❌ | ❌ | ❌ |
+| Agent / AI skill file | ✅ | ❌ | ❌ | ❌ | ❌ |
+| Works with standard GitHub PRs | ✅ | ✅ | ❌ | ✅ | ✅ |
+| No account or subscription needed | ✅ | ❌ | ✅ | ✅ | ✅ |
+| Open source | ✅ | ❌ | ✅ | — | ✅ |
+| Requires Go (no binary install yet) | ✅ | ❌ | ❌ | — | ❌ |
 
-What's not yet: `--json` output, `--dry-run`, `cn checkout`, `cn merge`, tree-shaped stacks (multiple children per parent), pulling someone else's stack by PR number. These are v0.1.1.
-
----
-
-## Agent-friendly
-
-See `AGENTS.md` for architectural seams and testing patterns. See `.claude/skills/chainrail/SKILL.md` for the Claude skill stub (trigger phrases, decomposition heuristics, footguns).
+Chainrail is early. Graphite is the mature, polished option — if you want a SaaS product with a web UI, use Graphite. Chainrail is for teams who want a lightweight, open-source tool that an AI agent can drive.
 
 ---
 
