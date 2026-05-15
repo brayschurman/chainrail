@@ -50,11 +50,12 @@ type Layer struct {
 type PendingAction int
 
 const (
-	ActionNone     PendingAction = iota
-	ActionCheckout               // git checkout the selected branch
-	ActionOpenPR                 // open the PR in the browser
-	ActionSync                   // run cn sync from the selected branch
-	ActionSubmit                 // run cn submit
+	ActionNone       PendingAction = iota
+	ActionCheckout                 // git checkout the selected branch
+	ActionOpenPR                   // open the PR in the browser
+	ActionSync                     // run cn sync from the selected branch
+	ActionSubmit                   // run cn submit
+	ActionViewDiff                 // open PR diff in the chainrail viewer
 )
 
 // Result is returned after the TUI exits and carries any pending action.
@@ -388,6 +389,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	case "o":
 		if len(m.Layers) > 0 && m.Layers[m.Cursor].PRNumber > 0 {
+			m.result = Result{Action: ActionViewDiff, PRNumber: m.Layers[m.Cursor].PRNumber}
+			return m, tea.Quit
+		}
+	case "O":
+		if len(m.Layers) > 0 && m.Layers[m.Cursor].PRNumber > 0 {
 			m.result = Result{Action: ActionOpenPR, PRNumber: m.Layers[m.Cursor].PRNumber}
 			return m, tea.Quit
 		}
@@ -588,7 +594,8 @@ func (m Model) View() string {
 		}
 		b.WriteString(styleKey.Render("↑↓") + styleFaint.Render(" navigate  "))
 		b.WriteString(styleKey.Render("c") + styleFaint.Render(" checkout  "))
-		b.WriteString(styleKey.Render("o") + styleFaint.Render(" open PR  "))
+		b.WriteString(styleKey.Render("o") + styleFaint.Render(" view diff  "))
+		b.WriteString(styleKey.Render("O") + styleFaint.Render(" GitHub  "))
 		b.WriteString(styleKey.Render("r") + styleFaint.Render(" rename  "))
 		b.WriteString(styleKey.Render("s") + styleFaint.Render(" sync  "))
 		b.WriteString(styleKey.Render("p") + styleFaint.Render(" submit  "))

@@ -315,6 +315,9 @@ func executeStatusAction(out io.Writer, r output.Renderer, result tui.Result, de
 			return fmt.Errorf("gh pr view --web: %w", err)
 		}
 
+	case tui.ActionViewDiff:
+		return runView(out, r, result.PRNumber, viewDeps{gh: deps.gh})
+
 	case tui.ActionSync:
 		g := git.New(deps.cwd)
 		if err := g.Checkout(result.Branch); err != nil {

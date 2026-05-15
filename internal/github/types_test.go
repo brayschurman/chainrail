@@ -56,6 +56,7 @@ type interfaceShape interface {
 	UpdatePRBody(ctx context.Context, number int, body string) error
 	UpdatePRBase(ctx context.Context, number int, newBase string) error
 	UpdatePRTitle(ctx context.Context, number int, newTitle string) error
+	PRDiff(ctx context.Context, number int) (string, error)
 }
 
 func TestGitHubClientInterfaceShape(t *testing.T) {

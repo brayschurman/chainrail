@@ -341,6 +341,14 @@ func (c *GhCli) UpdatePRBody(_ context.Context, number int, body string) error {
 	return nil
 }
 
+func (c *GhCli) PRDiff(_ context.Context, number int) (string, error) {
+	out, err := c.run("gh", "pr", "diff", strconv.Itoa(number), "--patch")
+	if err != nil {
+		return "", wrapGhErr(err, fmt.Sprintf("gh pr diff %d", number))
+	}
+	return string(out), nil
+}
+
 func (c *GhCli) UpdatePRTitle(_ context.Context, number int, newTitle string) error {
 	_, err := c.run("gh", "pr", "edit", strconv.Itoa(number), "--title", newTitle)
 	if err != nil {

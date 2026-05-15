@@ -25,6 +25,9 @@ type GitHubClient interface {
 	UpdatePRBody(ctx context.Context, number int, body string) error
 	UpdatePRBase(ctx context.Context, number int, newBase string) error
 	UpdatePRTitle(ctx context.Context, number int, newTitle string) error
+	// PRDiff returns the unified diff for a PR as a single string,
+	// equivalent to `gh pr diff <number> --patch`.
+	PRDiff(ctx context.Context, number int) (string, error)
 }
 
 type PullRequest struct {

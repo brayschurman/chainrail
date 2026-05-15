@@ -12,6 +12,7 @@ type MockGhClient struct {
 	Calls              []string
 	reviewRequested    map[int]bool
 	changesSinceReview map[int]int
+	prDiffs            map[int]string
 }
 
 func NewMock() *MockGhClient {
@@ -157,6 +158,22 @@ func (m *MockGhClient) UpdatePRBody(_ context.Context, number int, body string) 
 	pr.Body = body
 	m.PRs[number] = pr
 	return nil
+}
+
+// PRDiffs lets tests inject fixture diffs per PR number.
+func (m *MockGhClient) SetPRDiff(number int, diff string) {
+	if m.prDiffs == nil {
+		m.prDiffs = map[int]string{}
+	}
+	m.prDiffs[number] = diff
+}
+
+func (m *MockGhClient) PRDiff(_ context.Context, number int) (string, error) {
+	m.record(fmt.Sprintf("PRDiff(%d)", number))
+	if d, ok := m.prDiffs[number]; ok {
+		return d, nil
+	}
+	return "", fmt.Errorf("mock: no diff for PR #%d", number)
 }
 
 func (m *MockGhClient) UpdatePRTitle(_ context.Context, number int, newTitle string) error {
