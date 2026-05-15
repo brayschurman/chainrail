@@ -426,6 +426,7 @@ func (m Model) View() string {
 	mp.ensureCache()
 
 	header := mp.renderTopBar()
+	preReview := mp.renderPreReviewPanel(m.width)
 	sidebar := mp.renderSidebarCached()
 	diff := mp.renderDiffCached()
 	body := lipgloss.JoinHorizontal(lipgloss.Top, sidebar, diff)
@@ -437,7 +438,12 @@ func (m Model) View() string {
 		foot = mp.renderKeybindings(m.width)
 	}
 
-	return header + "\n" + body + "\n" + foot
+	out := header + "\n"
+	if preReview != "" {
+		out += preReview + "\n"
+	}
+	out += body + "\n" + foot
+	return out
 }
 
 // ---------------------------------------------------------------------------
@@ -484,6 +490,132 @@ func (m Model) renderTopBar() string {
 		gap = 1
 	}
 	return styleChrome.Render(left) + styleChrome.Render(strings.Repeat(" ", gap)) + right + styleChrome.Render(" ")
+}
+
+// renderPreReviewPanel produces the chip-style aggregator that sits between
+// the top bar and the body. Returns "" when there's nothing useful to say
+// (no detector signals fired and no agent-PR markers worth mentioning).
+//
+// When terminal height is tight (<=20 rows), we collapse to a single-line
+// chip row: "PRE-REVIEW · 🚨1 · ⚠3 · ↻2"; otherwise we render one line per
+// signal category for legibility.
+func (m Model) renderPreReviewPanel(w int) string {
+	ciW, ciC := m.ciCounts()
+	piH, piS := m.piCounts()
+	dupes := m.dupeCount()
+	totalFiles := len(m.Files)
+	if ciW == 0 && ciC == 0 && piH == 0 && piS == 0 && dupes == 0 &&
+		m.PlanSignal.Severity == PlanPresent {
+		// Everything's clean — no reason to add a panel row.
+		return ""
+	}
+
+	if m.height > 0 && m.height <= 20 {
+		// Compact single-line chip strip.
+		var chips []string
+		if ciW > 0 {
+			chips = append(chips, styleCIBlock.Render(fmt.Sprintf("🚨%d", ciW)))
+		}
+		if ciC > 0 {
+			chips = append(chips, styleCIWarn.Render(fmt.Sprintf("⚠%d", ciC)))
+		}
+		if piH > 0 {
+			chips = append(chips, styleCIBlock.Render(fmt.Sprintf("☣%d", piH)))
+		}
+		if dupes > 0 {
+			chips = append(chips, styleCIWarn.Render(fmt.Sprintf("↻%d", dupes)))
+		}
+		if m.PlanSignal.Severity == PlanMissing {
+			chips = append(chips, styleCIBlock.Render("no plan"))
+		} else if m.PlanSignal.Severity == PlanThin {
+			chips = append(chips, styleCIWarn.Render("thin plan"))
+		}
+		line := " " + styleHeading.Render("PRE-REVIEW") + "  " + strings.Join(chips, " · ")
+		return styleChrome.Width(w).Render(line)
+	}
+
+	// Multi-line expanded panel.
+	var lines []string
+	lines = append(lines, styleChrome.Width(w).Render(" "+styleHeading.Render("PRE-REVIEW")))
+
+	if ciW > 0 || ciC > 0 {
+		marker := styleCIBlock.Render(" 🚨")
+		text := fmt.Sprintf(" %d weakening, %d config touched", ciW, ciC)
+		if ciW == 0 {
+			marker = styleCIWarn.Render(" ⚠ ")
+			text = fmt.Sprintf(" %d CI / test / coverage config touched", ciC)
+		}
+		lines = append(lines, styleChrome.Width(w).Render(marker+text))
+	}
+	if piH > 0 || piS > 0 {
+		marker := styleCIBlock.Render(" ☣ ")
+		text := fmt.Sprintf(" %d high/critical, %d suspect — prompt-injection risk", piH, piS)
+		if piH == 0 {
+			marker = styleCIWarn.Render(" ☣ ")
+			text = fmt.Sprintf(" %d suspect prompt-injection signals", piS)
+		}
+		lines = append(lines, styleChrome.Width(w).Render(marker+text))
+	}
+	if dupes > 0 {
+		lines = append(lines, styleChrome.Width(w).Render(
+			styleCIWarn.Render(" ↻ ")+
+				fmt.Sprintf(" %d files have new symbols with possible duplicates", dupes)))
+	}
+	switch m.PlanSignal.Severity {
+	case PlanMissing:
+		hint := ""
+		if m.ReviewState != nil && m.ReviewState.NudgedForPlanAt.IsZero() && m.PlanNudger != nil {
+			hint = styleKeyDim.Render("  press P to nudge")
+		}
+		lines = append(lines, styleChrome.Width(w).Render(
+			styleCIBlock.Render(" 🚨")+" no implementation plan in PR body"+hint))
+	case PlanThin:
+		lines = append(lines, styleChrome.Width(w).Render(
+			styleCIWarn.Render(" ⚠ ")+fmt.Sprintf(" thin plan in PR body (%d chars, no structure)", m.PlanSignal.Chars)))
+	}
+	lines = append(lines, styleChrome.Width(w).Render(
+		styleKeyDim.Render(fmt.Sprintf(" · %d files", totalFiles))))
+
+	return strings.Join(lines, "\n")
+}
+
+// ciCounts returns the number of weakening / config-only CI signals.
+func (m Model) ciCounts() (weakening, config int) {
+	for _, s := range m.CISignals {
+		switch s.Risk {
+		case CIRiskWeakening:
+			weakening++
+		case CIRiskConfig:
+			config++
+		}
+	}
+	return weakening, config
+}
+
+// piCounts returns the number of high/critical and suspect prompt-injection
+// signals across all files.
+func (m Model) piCounts() (high, suspect int) {
+	for _, s := range m.PromptInjectSignals {
+		switch s.Severity {
+		case PromptInjectCritical, PromptInjectHigh:
+			high++
+		case PromptInjectSuspect:
+			suspect++
+		}
+	}
+	return high, suspect
+}
+
+// dupeCount returns the number of files that have at least one duplicate-
+// symbol finding.
+func (m Model) dupeCount() int {
+	n := 0
+	for _, s := range m.DupeSignals {
+		if len(s.Findings) > 0 {
+			n++
+		}
+	}
+	return n
 }
 
 // planBadge renders a one-chip indicator for plan presence. Empty when PR
@@ -1178,13 +1310,43 @@ func (m Model) sidebarWidth() int {
 }
 
 // bodyHeight is the height of the sidebar and diff panes (i.e. between the
-// top header bar and the keybinding bar).
+// top header bar, the pre-review panel, and the keybinding bar).
 func (m Model) bodyHeight() int {
-	h := m.height - 2
+	h := m.height - 2 - m.preReviewHeight()
 	if h < 5 {
 		h = 5
 	}
 	return h
+}
+
+// preReviewHeight is the number of lines the pre-review panel will consume.
+// Mirrors the line count produced by renderPreReviewPanel.
+func (m Model) preReviewHeight() int {
+	ciW, ciC := m.ciCounts()
+	piH, piS := m.piCounts()
+	dupes := m.dupeCount()
+	if ciW == 0 && ciC == 0 && piH == 0 && piS == 0 && dupes == 0 &&
+		m.PlanSignal.Severity == PlanPresent {
+		return 0
+	}
+	if m.height > 0 && m.height <= 20 {
+		return 1 // compact chip mode
+	}
+	n := 1 // header line
+	if ciW > 0 || ciC > 0 {
+		n++
+	}
+	if piH > 0 || piS > 0 {
+		n++
+	}
+	if dupes > 0 {
+		n++
+	}
+	if m.PlanSignal.Severity != PlanPresent {
+		n++
+	}
+	n++ // file count footer
+	return n
 }
 
 // diffContentHeight is the number of lines available for actual diff content
